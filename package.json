@@ -1,23 +1,7 @@
 {
   "name": "premium-discord-bot",
-  "version": "4.0.0",
-  "description": "Complete Discord moderation bot with ticket system, reaction roles, and verification",
-  "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
-  "dependencies": {
-    "discord.js": "^14.14.1",
-    "dotenv": "^16.3.1",
-    "sqlite3": "^5.1.6"
-  },
-  "engines": {
-    "node": ">=18.0.0"
-  }
-}{
-  "name": "premium-discord-bot",
-  "version": "4.0.0",
-  "description": "Complete Discord moderation bot with ticket system, reaction roles, and verification",
+  "version": "5.0.0",
+  "description": "Complete Discord moderation bot with verification, tickets, reaction roles",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
