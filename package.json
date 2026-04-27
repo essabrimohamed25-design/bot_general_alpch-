@@ -1,7 +1,7 @@
 {
-  "name": "advanced-moderation-bot",
-  "version": "2.0.0",
-  "description": "Advanced Discord moderation bot with database persistence",
+  "name": "professional-moderation-bot",
+  "version": "3.0.0",
+  "description": "Premium Discord moderation bot with professional announcement system",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
