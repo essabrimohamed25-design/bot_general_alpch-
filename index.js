@@ -1,5 +1,6 @@
 const { Client, GatewayIntentBits, EmbedBuilder, PermissionsBitField, ChannelType, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const sqlite3 = require('sqlite3').verbose();
+const fs = require('fs');
 require('dotenv').config();
 
 // ============================================
@@ -15,6 +16,9 @@ db.serialize(() => {
     db.run(`CREATE TABLE IF NOT EXISTS ticket_config (guild_id TEXT PRIMARY KEY, panel_channel TEXT, category TEXT, log_channel TEXT, support_role TEXT)`);
     db.run(`CREATE TABLE IF NOT EXISTS reaction_roles (guild_id TEXT, message_id TEXT, channel_id TEXT, emoji TEXT, role_id TEXT, PRIMARY KEY (guild_id, message_id, emoji))`);
     db.run(`CREATE TABLE IF NOT EXISTS reaction_panels (guild_id TEXT PRIMARY KEY, message_id TEXT, channel_id TEXT)`);
+    
+    // New verification table
+    db.run(`CREATE TABLE IF NOT EXISTS verification_config (guild_id TEXT PRIMARY KEY, auto_role TEXT, verified_role TEXT, channel TEXT, image_url TEXT, setup_by TEXT, setup_at TEXT)`);
     console.log('✅ Database initialized');
 });
 
@@ -46,6 +50,135 @@ const client = new Client({
 const userMessages = new Map();
 const activeGiveaways = new Map();
 const setupSessions = new Map();
+
+// ============================================
+// VERIFICATION FUNCTIONS
+// ============================================
+function saveVerificationConfig(guildId, autoRole, verifiedRole, channel, imageUrl, setupBy) {
+    return new Promise((resolve) => {
+        db.run(`INSERT OR REPLACE INTO verification_config (guild_id, auto_role, verified_role, channel, image_url, setup_by, setup_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [guildId, autoRole, verifiedRole, channel, imageUrl, setupBy, new Date().toISOString()], () => resolve());
+    });
+}
+
+function getVerificationConfig(guildId) {
+    return new Promise((resolve) => {
+        db.get(`SELECT * FROM verification_config WHERE guild_id = ?`, [guildId], (err, row) => resolve(row));
+    });
+}
+
+async function sendVerificationPanel(channel) {
+    const config = await getVerificationConfig(channel.guild.id);
+    if (!config) {
+        return channel.send('❌ Verification system not configured! Use `!verif` to set it up.');
+    }
+
+    const embed = new EmbedBuilder()
+        .setColor(0x5865F2)
+        .setTitle(`✅ VERIFY YOURSELF`)
+        .setDescription(`Welcome to **${channel.guild.name}**!\n\nClick the button below to verify yourself and access the server.\n\n**Why verify?**\n• Access all channels\n• Participate in conversations\n• Join voice chats\n• Get full member benefits\n\n*One click is all it takes!*`)
+        .setImage(config.image_url)
+        .setThumbnail(channel.guild.iconURL())
+        .setTimestamp()
+        .setFooter({ text: channel.guild.name, iconURL: channel.guild.iconURL() });
+
+    const row = new ActionRowBuilder()
+        .addComponents(
+            new ButtonBuilder()
+                .setCustomId('verify_button')
+                .setLabel('Verify Yourself')
+                .setEmoji('✅')
+                .setStyle(ButtonStyle.Success)
+        );
+
+    await channel.send({ embeds: [embed], components: [row] });
+}
+
+// ============================================
+// VERIFICATION SETUP COLLECTOR
+// ============================================
+async function startVerificationSetup(message) {
+    const filter = (m) => m.author.id === message.author.id;
+    let step = 0;
+    let config = {};
+    
+    const stepMessages = [
+        '📌 **Step 1/4** - Please send the **Auto Role ID**\n> *Role that users get automatically when they join the server*\n\nExample: `123456789012345678`',
+        '📌 **Step 2/4** - Please send the **Verified Role ID**\n> *Role that users get after clicking the verify button*\n\nExample: `123456789012345678`',
+        '📌 **Step 3/4** - Please **send the channel ID** for verification panel\n> *Where the verification panel should be sent*\n\nExample: `123456789012345678`',
+        '📌 **Step 4/4** - Please send the **Image/Banner URL**\n> *Image that appears in the verification panel*\n\nExample: `https://example.com/image.png`'
+    ];
+    
+    const stepNames = ['auto_role', 'verified_role', 'channel', 'image_url'];
+    
+    await message.reply('🔧 **Verification System Setup**\n\n' + stepMessages[0]);
+    
+    const collector = message.channel.createMessageCollector({ filter, time: 120000, max: 4 });
+    
+    collector.on('collect', async (msg) => {
+        const value = msg.content.trim();
+        
+        if (step !== 3 && !value.match(/^\d+$/)) {
+            await msg.reply('❌ Please provide a valid role ID or channel ID (numbers only).');
+            return;
+        }
+        
+        if (step === 3) {
+            if (!value.match(/^https?:\/\/[^\s]+/)) {
+                await msg.reply('❌ Please provide a valid image URL (must start with http:// or https://).');
+                return;
+            }
+        }
+        
+        config[stepNames[step]] = value;
+        step++;
+        
+        if (step < stepMessages.length) {
+            await msg.reply(stepMessages[step]);
+        } else {
+            collector.stop();
+            
+            const autoRole = message.guild.roles.cache.get(config.auto_role);
+            const verifiedRole = message.guild.roles.cache.get(config.verified_role);
+            const verifyChannel = message.guild.channels.cache.get(config.channel);
+            
+            if (!autoRole) {
+                return msg.reply('❌ Invalid Auto Role ID! Please run `!verif` again.');
+            }
+            if (!verifiedRole) {
+                return msg.reply('❌ Invalid Verified Role ID! Please run `!verif` again.');
+            }
+            if (!verifyChannel) {
+                return msg.reply('❌ Invalid verification channel! Please run `!verif` again.');
+            }
+            
+            await saveVerificationConfig(message.guild.id, config.auto_role, config.verified_role, config.channel, config.image_url, message.author.id);
+            
+            const embed = new EmbedBuilder()
+                .setColor(0x22C55E)
+                .setTitle('✅ Verification System Configured')
+                .setDescription('Your verification system has been successfully configured!')
+                .addFields(
+                    { name: '📌 Auto Role', value: `<@&${config.auto_role}>`, inline: true },
+                    { name: '✅ Verified Role', value: `<@&${config.verified_role}>`, inline: true },
+                    { name: '📍 Channel', value: `<#${config.channel}>`, inline: true },
+                    { name: '🖼️ Image URL', value: `[Click to view](${config.image_url})`, inline: true }
+                )
+                .setTimestamp();
+            
+            await msg.reply({ embeds: [embed] });
+            await sendVerificationPanel(verifyChannel);
+            await msg.reply(`✅ Verification panel sent to ${verifyChannel}!`);
+            await sendLog(message.guild, 'VERIFICATION SETUP', 'System', message.author, 'Verification system configured');
+        }
+    });
+    
+    collector.on('end', (collected) => {
+        if (collected.size < stepMessages.length && step < stepMessages.length) {
+            message.reply('❌ Setup timed out! Please run `!verif` again.');
+        }
+    });
+}
 
 // ============================================
 // HELPER FUNCTIONS
@@ -228,7 +361,7 @@ async function createReactionPanel(channel, phoneRoleId, pcRoleId) {
 }
 
 // ============================================
-// TICKET SETUP COLLECTOR (Prefix command friendly)
+// TICKET SETUP COLLECTOR
 // ============================================
 async function startTicketSetup(message) {
     const filter = (m) => m.author.id === message.author.id;
@@ -244,7 +377,7 @@ async function startTicketSetup(message) {
     
     const stepNames = ['panel_channel', 'category', 'log_channel', 'support_role'];
     
-    const sentMsg = await message.reply(stepMessages[0]);
+    await message.reply(stepMessages[0]);
     
     const collector = message.channel.createMessageCollector({ filter, time: 60000, max: 4 });
     
@@ -284,7 +417,7 @@ async function startTicketSetup(message) {
 }
 
 // ============================================
-// REACTION ROLE SETUP COLLECTOR (Prefix command friendly)
+// REACTION ROLE SETUP COLLECTOR
 // ============================================
 async function startRoleTestSetup(message) {
     const filter = (m) => m.author.id === message.author.id;
@@ -298,7 +431,7 @@ async function startRoleTestSetup(message) {
     
     const stepNames = ['phone_role', 'pc_role'];
     
-    const sentMsg = await message.reply(stepMessages[0]);
+    await message.reply(stepMessages[0]);
     
     const collector = message.channel.createMessageCollector({ filter, time: 60000, max: 2 });
     
@@ -368,7 +501,7 @@ async function sendWelcomeAnnouncement(channel) {
             { name: '━━━━━━━━━━━━━━━━━━━━━━━━━━━━', value: ' ', inline: false },
             { name: '💬 │ GENERAL', value: '> Chat with the community', inline: false },
             { name: '━━━━━━━━━━━━━━━━━━━━━━━━━━━━', value: ' ', inline: false },
-            { name: '🔧 │ COMMANDS', value: '> Use !help to see all commands\n> Use !suggest to share ideas\n> Use !ticket for support', inline: false },
+            { name: '🔧 │ COMMANDS', value: '> Use !help to see all commands\n> Use !suggest to share ideas\n> Use !ticket for support\n> Use !verif to setup verification', inline: false },
             { name: '━━━━━━━━━━━━━━━━━━━━━━━━━━━━', value: ' ', inline: false },
             { name: '🎤 │ VOICE', value: '> Connect with members in voice channels', inline: false }
         )
@@ -445,7 +578,17 @@ client.on('guildMemberAdd', async (member) => {
             .setThumbnail(member.user.displayAvatarURL()).addFields({ name: 'ID', value: member.id, inline: true }).setTimestamp();
         await logChannel.send({ embeds: [embed] }).catch(() => {});
     }
-    if (AUTO_ROLE_ID) { try { await member.roles.add(AUTO_ROLE_ID); } catch (err) {} }
+    
+    // Check for verification auto role
+    const verificationConfig = await getVerificationConfig(member.guild.id);
+    if (verificationConfig && verificationConfig.auto_role) {
+        try { 
+            await member.roles.add(verificationConfig.auto_role);
+            console.log(`✅ Assigned verification auto role to ${member.user.tag}`);
+        } catch (err) { console.error('Failed to assign verification auto role:', err.message); }
+    } else if (AUTO_ROLE_ID) { 
+        try { await member.roles.add(AUTO_ROLE_ID); } catch (err) {} 
+    }
 });
 
 client.on('guildMemberRemove', async (member) => {
@@ -493,8 +636,55 @@ client.on('messageCreate', async (message) => {
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isButton()) return;
     
+    // Verification button
+    if (interaction.customId === 'verify_button') {
+        const config = await getVerificationConfig(interaction.guild.id);
+        if (!config) {
+            return interaction.reply({ content: '❌ Verification system not configured!', ephemeral: true });
+        }
+        
+        const member = interaction.member;
+        const autoRole = config.auto_role;
+        const verifiedRole = config.verified_role;
+        
+        try {
+            if (autoRole && member.roles.cache.has(autoRole)) {
+                await member.roles.remove(autoRole);
+            }
+            
+            await member.roles.add(verifiedRole);
+            
+            const embed = new EmbedBuilder()
+                .setColor(0x22C55E)
+                .setTitle('✅ Verification Successful')
+                .setDescription(`Welcome to **${interaction.guild.name}**, ${member.user.toString()}!\n\nYou have been successfully verified and now have access to the server.\n\n**Enjoy your stay!** 🎉`)
+                .setTimestamp()
+                .setFooter({ text: interaction.guild.name, iconURL: interaction.guild.iconURL() });
+            
+            await interaction.reply({ embeds: [embed], ephemeral: true });
+            
+            const logChannel = interaction.guild.channels.cache.get(LOG_CHANNEL_ID);
+            if (logChannel) {
+                const logEmbed = new EmbedBuilder()
+                    .setColor(0x5865F2)
+                    .setTitle('✅ User Verified')
+                    .setDescription(`${member.user.tag} has been verified!`)
+                    .addFields(
+                        { name: 'User ID', value: member.id, inline: true },
+                        { name: 'Verified At', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true }
+                    )
+                    .setTimestamp();
+                await logChannel.send({ embeds: [logEmbed] }).catch(() => {});
+            }
+            
+        } catch (error) {
+            console.error('Verification error:', error);
+            await interaction.reply({ content: '❌ Failed to verify. Please contact an administrator.', ephemeral: true });
+        }
+    }
+    
     // Reaction roles buttons
-    if (interaction.customId === 'role_phone') {
+    else if (interaction.customId === 'role_phone') {
         const roles = await getReactionRoles(interaction.guild.id, interaction.message.id);
         const phoneRole = roles.find(r => r.emoji === '📱');
         if (phoneRole && phoneRole.role_id) {
@@ -603,12 +793,12 @@ client.on('messageCreate', async (message) => {
     const { member, guild, channel } = message;
     
     // Permission check for mod commands
-    const modCmds = ['ban', 'kick', 'mute', 'unmute', 'warn', 'clear', 'lock', 'unlock', 'giverole', 'removerole', 'unban', 'ann', 'anni', 'ticketsetup', 'ticket', 'giveaway', 'roltest'];
+    const modCmds = ['ban', 'kick', 'mute', 'unmute', 'warn', 'clear', 'lock', 'unlock', 'giverole', 'removerole', 'unban', 'ann', 'anni', 'ticketsetup', 'ticket', 'giveaway', 'roltest', 'verif', 'resetverif', 'sendpanel', 'verifstatus'];
     if (modCmds.includes(cmd) && !hasPermission(member)) {
         return message.reply('❌ You need moderator permissions!');
     }
     
-    // ========== HELP ==========
+    // ========== HELP (Updated with verification commands) ==========
     if (cmd === 'help') {
         const embed = new EmbedBuilder().setColor(0x5865F2).setTitle('🛡️ Premium Bot - Commands')
             .setDescription('**Moderation Commands:**')
@@ -632,6 +822,10 @@ client.on('messageCreate', async (message) => {
                 { name: '!ticketsetup', value: 'Setup ticket system (step by step)', inline: true },
                 { name: '!ticket', value: 'Send ticket panel', inline: true },
                 { name: '!roltest', value: 'Setup reaction role panel', inline: true },
+                { name: '!verif', value: 'Setup verification system (step by step)', inline: true },
+                { name: '!sendpanel', value: 'Send verification panel again', inline: true },
+                { name: '!verifstatus', value: 'Show verification status', inline: true },
+                { name: '!resetverif', value: 'Reset verification system', inline: true },
                 { name: '!suggest <msg>', value: 'Submit suggestion', inline: true },
                 { name: '!giveaway <prize> <minutes> <winners>', value: 'Start giveaway', inline: true }
             )
@@ -639,8 +833,64 @@ client.on('messageCreate', async (message) => {
         return message.reply({ embeds: [embed] });
     }
     
-    // ========== TICKET SETUP (Using Collector) ==========
-    if (cmd === 'ticketsetup') {
+    // ========== VERIFICATION SETUP ==========
+    if (cmd === 'verif') {
+        await startVerificationSetup(message);
+    }
+    
+    // ========== RESET VERIFICATION ==========
+    else if (cmd === 'resetverif') {
+        db.run(`DELETE FROM verification_config WHERE guild_id = ?`, [guild.id], async (err) => {
+            if (err) {
+                message.reply('❌ Failed to reset verification system.');
+            } else {
+                message.reply('✅ Verification system has been reset! Use `!verif` to set it up again.');
+                await sendLog(guild, 'VERIFICATION RESET', 'System', member.user, 'Verification system reset');
+            }
+        });
+    }
+    
+    // ========== SEND VERIFICATION PANEL ==========
+    else if (cmd === 'sendpanel') {
+        const config = await getVerificationConfig(guild.id);
+        if (!config) return message.reply('❌ Verification system not configured! Use `!verif` first.');
+        
+        const verifyChannel = guild.channels.cache.get(config.channel);
+        if (!verifyChannel) return message.reply('❌ Verification channel not found! Please reconfigure with `!verif`.');
+        
+        await sendVerificationPanel(verifyChannel);
+        await message.reply(`✅ Verification panel sent to ${verifyChannel}!`);
+        await sendLog(guild, 'VERIFICATION PANEL', 'Channel', member.user, 'Verification panel sent');
+    }
+    
+    // ========== VERIFICATION STATUS ==========
+    else if (cmd === 'verifstatus') {
+        const config = await getVerificationConfig(guild.id);
+        if (!config) return message.reply('❌ Verification system is **NOT configured**. Use `!verif` to set it up.');
+        
+        const autoRole = guild.roles.cache.get(config.auto_role);
+        const verifiedRole = guild.roles.cache.get(config.verified_role);
+        const verifyChannel = guild.channels.cache.get(config.channel);
+        
+        const embed = new EmbedBuilder()
+            .setColor(0x5865F2)
+            .setTitle('📊 Verification System Status')
+            .setDescription('Current verification configuration:')
+            .addFields(
+                { name: '📌 Auto Role', value: autoRole ? `<@&${config.auto_role}>` : '❌ Not found', inline: true },
+                { name: '✅ Verified Role', value: verifiedRole ? `<@&${config.verified_role}>` : '❌ Not found', inline: true },
+                { name: '📍 Channel', value: verifyChannel ? `<#${config.channel}>` : '❌ Not found', inline: true },
+                { name: '🖼️ Image URL', value: `[Click to view](${config.image_url})`, inline: true },
+                { name: '👤 Setup By', value: `<@${config.setup_by}>`, inline: true },
+                { name: '📅 Setup Date', value: `<t:${Math.floor(new Date(config.setup_at).getTime() / 1000)}:F>`, inline: true }
+            )
+            .setTimestamp();
+        
+        await message.reply({ embeds: [embed] });
+    }
+    
+    // ========== TICKET SETUP ==========
+    else if (cmd === 'ticketsetup') {
         await startTicketSetup(message);
     }
     
@@ -657,7 +907,7 @@ client.on('messageCreate', async (message) => {
         await sendLog(guild, 'TICKET PANEL', 'Channel', member.user, 'Ticket panel sent');
     }
     
-    // ========== REACTION ROLE SETUP (Using Collector) ==========
+    // ========== REACTION ROLE SETUP ==========
     else if (cmd === 'roltest') {
         await startRoleTestSetup(message);
     }
@@ -854,96 +1104,3 @@ client.on('messageCreate', async (message) => {
         const embed = new EmbedBuilder().setColor(0x5865F2).setTitle(`${user.tag}'s Avatar`)
             .setImage(user.displayAvatarURL({ size: 1024, dynamic: true })).setTimestamp();
         await message.reply({ embeds: [embed] });
-    }
-    
-    // ========== ANNOUNCE ==========
-    else if (cmd === 'ann') {
-        const text = args.join(' ');
-        if (!text) return message.reply('Usage: `!ann <message>`');
-        await message.delete().catch(() => {});
-        await sendProfessionalAnnouncement(channel, text);
-        await sendLog(guild, 'ANNOUNCEMENT', 'Channel', member.user, text.slice(0, 100));
-    }
-    
-    // ========== ANNI ==========
-    else if (cmd === 'anni') {
-        await message.delete().catch(() => {});
-        await sendWelcomeAnnouncement(channel);
-        await sendLog(guild, 'WELCOME ANNOUNCEMENT', 'Channel', member.user, 'Full welcome announcement sent');
-    }
-    
-    // ========== SUGGEST ==========
-    else if (cmd === 'suggest') {
-        const suggestion = args.join(' ');
-        if (!suggestion) return message.reply('Usage: `!suggest <your suggestion>`');
-        const embed = new EmbedBuilder().setColor(0x5865F2).setTitle('💡 Suggestion').setDescription(suggestion)
-            .setAuthor({ name: member.user.tag, iconURL: member.user.displayAvatarURL() }).setTimestamp();
-        const msg = await channel.send({ embeds: [embed] });
-        await msg.react('✅'); await msg.react('❌');
-        saveSuggestion(msg.id, member.user.id, suggestion);
-        await message.reply('✅ Suggestion submitted!');
-        await sendLog(guild, 'SUGGESTION', 'Channel', member.user, suggestion.slice(0, 100));
-    }
-    
-    // ========== GIVEAWAY ==========
-    else if (cmd === 'giveaway') {
-        const prize = args[0];
-        const duration = parseInt(args[1]);
-        const winners = parseInt(args[2]);
-        if (!prize || !duration || !winners) return message.reply('Usage: `!giveaway <prize> <minutes> <winners>`');
-        const endTime = Date.now() + (duration * 60 * 1000);
-        const embed = new EmbedBuilder().setColor(0x5865F2).setTitle('🎉 GIVEAWAY 🎉')
-            .setDescription(`**Prize:** ${prize}\n**Winners:** ${winners}\n**Duration:** ${duration} minutes`)
-            .setFooter({ text: 'React with 🎉 to enter!' }).setTimestamp(endTime);
-        const msg = await channel.send({ embeds: [embed] });
-        await msg.react('🎉');
-        saveGiveaway(msg.id, channel.id, prize, winners, endTime);
-        activeGiveaways.set(msg.id, { prize, winners, endTime, channelId: channel.id });
-        
-        setTimeout(async () => {
-            const fetched = await msg.fetch().catch(() => null);
-            if (!fetched) return;
-            const reaction = fetched.reactions.cache.get('🎉');
-            let participants = reaction ? (await reaction.users.fetch()).filter(u => !u.bot) : [];
-            const winnerList = [...participants.values()];
-            const selectedWinners = [];
-            for (let i = 0; i < Math.min(winners, winnerList.length); i++) {
-                const idx = Math.floor(Math.random() * winnerList.length);
-                selectedWinners.push(winnerList[idx]);
-                winnerList.splice(idx, 1);
-            }
-            const resultEmbed = new EmbedBuilder().setColor(selectedWinners.length ? 0x22C55E : 0xEF4444)
-                .setTitle('🎉 GIVEAWAY ENDED 🎉')
-                .setDescription(`**Prize:** ${prize}\n**Winners:** ${selectedWinners.length ? selectedWinners.map(w => w.toString()).join(', ') : 'No winners'}`)
-                .setTimestamp();
-            await channel.send({ embeds: [resultEmbed] });
-            activeGiveaways.delete(msg.id);
-        }, duration * 60 * 1000);
-        
-        await message.reply(`✅ Giveaway started for **${prize}**!`);
-        await sendLog(guild, 'GIVEAWAY', 'Channel', member.user, `Prize: ${prize} | Duration: ${duration}m | Winners: ${winners}`);
-    }
-});
-
-// ============================================
-// READY EVENT
-// ============================================
-client.once('ready', () => {
-    console.log(`✅ ${client.user.tag} is online!`);
-    console.log(`📋 Prefix: !`);
-    console.log(`👮 Mod Role ID: ${MOD_ROLE_ID || 'Not set (admin only)'}`);
-    console.log(`📝 Log Channel ID: ${LOG_CHANNEL_ID || 'Not set'}`);
-    console.log(`🎫 Ticket system ready`);
-    console.log(`🎭 Reaction role system ready`);
-    client.user.setActivity('!help | Premium Bot', { type: 3 });
-});
-
-// ============================================
-// ERROR HANDLING & START
-// ============================================
-process.on('unhandledRejection', (err) => console.error('Unhandled rejection:', err.message));
-process.on('uncaughtException', (err) => console.error('Uncaught exception:', err.message));
-process.on('SIGINT', () => { db.close(() => process.exit(0)); });
-process.on('SIGTERM', () => { db.close(() => process.exit(0)); });
-
-client.login(BOT_TOKEN);
