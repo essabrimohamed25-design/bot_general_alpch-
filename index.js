@@ -1,4 +1,7 @@
-const { Client, GatewayIntentBits, EmbedBuilder, PermissionsBitField, ChannelType } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder, PermissionsBitField } = require('discord.js');
+const sqlite3 = require('sqlite3').verbose();
+const { open } = require('sqlite3');
+const fs = require('fs');
 require('dotenv').config();
 
 // ============================================
@@ -9,7 +12,87 @@ const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID;
 const MOD_ROLE_ID = process.env.MOD_ROLE_ID;
 const ANNI_IMAGE_URL = "https://media.discordapp.net/attachments/1462437612647088335/1482006389843824670/content.png?ex=69f00c41&is=69eebac1&hm=72c7387b87dc3d1016044156f3311dd0bd5f7578a05a70d701d500e325615de0&=&format=webp&quality=lossless&width=1356&height=904";
 
-if (!TOKEN) { console.error('❌ Missing BOT_TOKEN'); process.exit(1); }
+if (!TOKEN) {
+    console.error('❌ Missing BOT_TOKEN in environment variables');
+    process.exit(1);
+}
+
+// ============================================
+// SQLITE DATABASE SETUP
+// ============================================
+const db = new sqlite3.Database('./warnings.db');
+
+// Create warnings table if not exists
+db.run(`
+    CREATE TABLE IF NOT EXISTS warnings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        guild_id TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        moderator TEXT NOT NULL,
+        date TEXT NOT NULL
+    )
+`);
+
+// Create index for faster lookups
+db.run(`CREATE INDEX IF NOT EXISTS idx_user_id ON warnings(user_id)`);
+db.run(`CREATE INDEX IF NOT EXISTS idx_guild_id ON warnings(guild_id)`);
+
+// ============================================
+// DATABASE FUNCTIONS
+// ============================================
+function addWarning(userId, guildId, reason, moderator) {
+    return new Promise((resolve, reject) => {
+        const date = new Date().toISOString();
+        db.run(
+            `INSERT INTO warnings (user_id, guild_id, reason, moderator, date) VALUES (?, ?, ?, ?, ?)`,
+            [userId, guildId, reason, moderator, date],
+            function(err) {
+                if (err) reject(err);
+                else resolve(this.lastID);
+            }
+        );
+    });
+}
+
+function getWarnings(userId, guildId) {
+    return new Promise((resolve, reject) => {
+        db.all(
+            `SELECT * FROM warnings WHERE user_id = ? AND guild_id = ? ORDER BY date DESC`,
+            [userId, guildId],
+            (err, rows) => {
+                if (err) reject(err);
+                else resolve(rows || []);
+            }
+        );
+    });
+}
+
+function getWarningCount(userId, guildId) {
+    return new Promise((resolve, reject) => {
+        db.get(
+            `SELECT COUNT(*) as count FROM warnings WHERE user_id = ? AND guild_id = ?`,
+            [userId, guildId],
+            (err, row) => {
+                if (err) reject(err);
+                else resolve(row ? row.count : 0);
+            }
+        );
+    });
+}
+
+function clearWarnings(userId, guildId) {
+    return new Promise((resolve, reject) => {
+        db.run(
+            `DELETE FROM warnings WHERE user_id = ? AND guild_id = ?`,
+            [userId, guildId],
+            function(err) {
+                if (err) reject(err);
+                else resolve(this.changes);
+            }
+        );
+    });
+}
 
 // ============================================
 // CLIENT SETUP
@@ -24,12 +107,6 @@ const client = new Client({
         GatewayIntentBits.GuildVoiceStates
     ]
 });
-
-// ============================================
-// STORAGE
-// ============================================
-const warns = new Map(); // userID -> array of warns
-const activeTimeouts = new Map(); // channelID -> timeout
 
 // ============================================
 // HELPER FUNCTIONS
@@ -51,7 +128,7 @@ async function sendLog(guild, action, target, moderator, reason, extra = null) {
         .setFooter({ text: `ID: ${target?.id || 'N/A'}`, iconURL: moderator?.displayAvatarURL() });
 
     if (extra) embed.addFields({ name: 'ℹ️ Extra', value: extra, inline: false });
-    await logChannel.send({ embeds: [embed] });
+    await logChannel.send({ embeds: [embed] }).catch(() => {});
 }
 
 function hasModPermission(member) {
@@ -163,6 +240,7 @@ client.on('guildMemberRemove', async (member) => {
 client.on('voiceStateUpdate', async (oldState, newState) => {
     if (oldState.channelId === newState.channelId) return;
     const member = oldState.member || newState.member;
+    if (!member) return;
     let action = '';
     if (!oldState.channelId && newState.channelId) action = 'Joined Voice';
     else if (oldState.channelId && !newState.channelId) action = 'Left Voice';
@@ -200,9 +278,9 @@ client.on('messageCreate', async (message) => {
             .setTitle('🛡️ Moderation Bot - Help Panel')
             .setDescription('**Moderation Commands:**')
             .addFields(
-                { name: '🔨 Bans', value: '`!ban <userID> [reason]`', inline: true },
-                { name: '👢 Kicks', value: '`!kick <userID> [reason]`', inline: true },
-                { name: '🔇 Mute', value: '`!mute <userID> [reason]`', inline: true },
+                { name: '🔨 Ban', value: '`!ban <userID> [reason]`', inline: true },
+                { name: '👢 Kick', value: '`!kick <userID> [reason]`', inline: true },
+                { name: '🔇 Mute', value: '`!mute <userID> <time> [reason]`', inline: true },
                 { name: '🔊 Unmute', value: '`!unmute <userID> [reason]`', inline: true },
                 { name: '⚠️ Warn', value: '`!warn <userID> [reason]`', inline: true },
                 { name: '🗑️ Clear', value: '`!clear <amount>`', inline: true },
@@ -211,7 +289,7 @@ client.on('messageCreate', async (message) => {
                 { name: '🐢 Slowmode', value: '`!slowmode <seconds>`', inline: true },
                 { name: '⏱️ Timeout', value: '`!timeout <userID> <time> [reason]`', inline: true },
                 { name: '✅ Untimeout', value: '`!untimeout <userID> [reason]`', inline: true },
-                { name: '✏️ Nickname', value: '`!nick <userID> <newNick>`', inline: true },
+                { name: '✏️ Nick', value: '`!nick <userID> <newNick>`', inline: true },
                 { name: '➕ Add Role', value: '`!role <userID> <roleID>`', inline: true },
                 { name: '➖ Remove Role', value: '`!unrole <userID> <roleID>`', inline: true },
                 { name: '💬 Say', value: '`!say <message>`', inline: true },
@@ -228,9 +306,9 @@ client.on('messageCreate', async (message) => {
     }
 
     // Check mod permission for moderation commands
-    const modCommands = ['ban', 'kick', 'mute', 'unmute', 'warn', 'clear', 'lock', 'unlock', 'slowmode', 'timeout', 'untimeout', 'nick', 'role', 'unrole'];
+    const modCommands = ['ban', 'kick', 'mute', 'unmute', 'warn', 'clear', 'lock', 'unlock', 'slowmode', 'timeout', 'untimeout', 'nick', 'role', 'unrole', 'ann', 'anni'];
     if (modCommands.includes(command) && !hasModPermission(member)) {
-        return message.reply({ content: '❌ You need moderator permissions to use this command!', ephemeral: true });
+        return message.reply('❌ You need moderator permissions to use this command!');
     }
 
     // ========== BAN ==========
@@ -259,7 +337,7 @@ client.on('messageCreate', async (message) => {
         await sendLog(guild, 'KICK', target.user, message.author, reason);
     }
 
-    // ========== MUTE/TIMEOUT (alias) ==========
+    // ========== MUTE ==========
     else if (command === 'mute' || command === 'timeout') {
         const userId = args[0];
         const time = args[1] || '1h';
@@ -275,7 +353,7 @@ client.on('messageCreate', async (message) => {
         await sendLog(guild, 'MUTE/TIMEOUT', target.user, message.author, `${reason} | Duration: ${formatDuration(durationMs)}`);
     }
 
-    // ========== UNMUTE/UNTIMEOUT ==========
+    // ========== UNMUTE ==========
     else if (command === 'unmute' || command === 'untimeout') {
         const userId = args[0];
         const reason = args.slice(1).join(' ') || 'No reason provided';
@@ -283,33 +361,64 @@ client.on('messageCreate', async (message) => {
         const target = await getMember(guild, userId);
         if (!target) return message.reply('❌ User not found!');
         if (!target.moderatable) return message.reply('❌ I cannot remove timeout from this user!');
+        if (!target.communicationDisabledUntil) return message.reply('❌ This user is not muted!');
         await target.timeout(null);
         await message.reply(`✅ Unmuted ${target.user.tag}`);
         await sendLog(guild, 'UNMUTE', target.user, message.author, reason);
     }
 
-    // ========== WARN ==========
+    // ========== WARN (Persistent SQLite) ==========
     else if (command === 'warn') {
         const userId = args[0];
         const reason = args.slice(1).join(' ') || 'No reason provided';
         if (!userId) return message.reply('Usage: `!warn <userID> [reason]`');
         const target = await getMember(guild, userId);
         if (!target) return message.reply('❌ User not found!');
-        if (!warns.has(userId)) warns.set(userId, []);
-        warns.get(userId).push({ reason, mod: message.author.tag, date: new Date() });
-        await target.send({ embeds: [new EmbedBuilder().setColor(0xFFA500).setTitle('⚠️ Warning').setDescription(`You have been warned in ${guild.name}`).addFields({ name: 'Reason', value: reason }).setTimestamp()] }).catch(() => {});
-        await message.reply(`✅ Warned ${target.user.tag} (Total: ${warns.get(userId).length})`);
-        await sendLog(guild, 'WARN', target.user, message.author, reason);
+        
+        await addWarning(userId, guild.id, reason, message.author.tag);
+        const warningCount = await getWarningCount(userId, guild.id);
+        
+        try {
+            const warnEmbed = new EmbedBuilder()
+                .setColor(0xFFA500)
+                .setTitle('⚠️ Warning')
+                .setDescription(`You have been warned in **${guild.name}**`)
+                .addFields(
+                    { name: 'Moderator', value: message.author.tag, inline: true },
+                    { name: 'Reason', value: reason, inline: true },
+                    { name: 'Total Warnings', value: `${warningCount}`, inline: true }
+                )
+                .setTimestamp();
+            await target.send({ embeds: [warnEmbed] });
+        } catch (error) {
+            // User has DMs disabled
+        }
+        
+        await message.reply(`✅ Warned ${target.user.tag} (Total warnings: ${warningCount})`);
+        await sendLog(guild, 'WARN', target.user, message.author, reason + ` | Total warnings: ${warningCount}`);
     }
 
     // ========== CLEAR ==========
     else if (command === 'clear') {
         const amount = parseInt(args[0]);
         if (!amount || amount < 1 || amount > 100) return message.reply('Usage: `!clear <1-100>`');
-        const deleted = await channel.bulkDelete(amount, true);
-        const reply = await message.reply(`✅ Deleted ${deleted.size} messages`);
-        setTimeout(() => reply.delete(), 3000);
-        await sendLog(guild, 'CLEAR', { id: 'N/A', tag: 'Channel' }, message.author, `Deleted ${deleted.size} messages in #${channel.name}`);
+        
+        try {
+            const fetched = await channel.messages.fetch({ limit: amount });
+            const filtered = fetched.filter(msg => Date.now() - msg.createdTimestamp < 1209600000);
+            
+            if (filtered.size === 0) {
+                return message.reply('❌ Cannot delete messages older than 14 days! Please delete them manually.');
+            }
+            
+            const deleted = await channel.bulkDelete(filtered, true);
+            const reply = await message.reply(`✅ Deleted ${deleted.size} message(s)`);
+            setTimeout(() => reply.delete(), 3000);
+            await sendLog(guild, 'CLEAR', { id: 'N/A', tag: 'Channel' }, message.author, `Deleted ${deleted.size} messages in #${channel.name}`);
+        } catch (error) {
+            console.error('Clear error:', error.message);
+            message.reply('❌ Failed to clear messages. They may be older than 14 days or I lack permissions.');
+        }
     }
 
     // ========== LOCK ==========
@@ -333,7 +442,7 @@ client.on('messageCreate', async (message) => {
         const seconds = parseInt(args[0]);
         if (isNaN(seconds) || seconds < 0 || seconds > 21600) return message.reply('Usage: `!slowmode <0-21600>` (0 = off)');
         await channel.setRateLimitPerUser(seconds);
-        await message.reply(`✅ Slowmode set to ${seconds} seconds`);
+        await message.reply(`✅ Slowmode set to ${seconds} second(s)`);
         await sendLog(guild, 'SLOWMODE', { id: 'N/A', tag: 'Channel' }, message.author, `#${channel.name} set to ${seconds}s`);
     }
 
@@ -351,7 +460,7 @@ client.on('messageCreate', async (message) => {
         await sendLog(guild, 'NICKNAME', target.user, message.author, `${oldNick} → ${newNick}`);
     }
 
-    // ========== ROLE ==========
+    // ========== ADD ROLE ==========
     else if (command === 'role') {
         const userId = args[0];
         const roleId = args[1];
@@ -366,7 +475,7 @@ client.on('messageCreate', async (message) => {
         await sendLog(guild, 'ADD ROLE', target.user, message.author, `Role: ${role.name} (${roleId})`);
     }
 
-    // ========== UNROLE ==========
+    // ========== REMOVE ROLE ==========
     else if (command === 'unrole') {
         const userId = args[0];
         const roleId = args[1];
@@ -385,7 +494,7 @@ client.on('messageCreate', async (message) => {
     else if (command === 'say') {
         const text = args.join(' ');
         if (!text) return message.reply('Usage: `!say <message>`');
-        await message.delete();
+        await message.delete().catch(() => {});
         await channel.send(text);
     }
 
@@ -394,18 +503,31 @@ client.on('messageCreate', async (message) => {
         const userId = args[0];
         const target = userId ? await getMember(guild, userId) : member;
         if (!target) return message.reply('❌ User not found!');
+        const warningCount = await getWarningCount(target.id, guild.id);
+        const warnings = await getWarnings(target.id, guild.id);
+        
         const embed = new EmbedBuilder()
             .setColor(0x5865F2)
             .setTitle(`📊 ${target.user.tag}`)
             .setThumbnail(target.user.displayAvatarURL())
             .addFields(
                 { name: 'ID', value: target.id, inline: true },
+                { name: 'Nickname', value: target.nickname || 'None', inline: true },
                 { name: 'Joined Server', value: `<t:${Math.floor(target.joinedTimestamp / 1000)}:R>`, inline: true },
                 { name: 'Joined Discord', value: `<t:${Math.floor(target.user.createdTimestamp / 1000)}:R>`, inline: true },
                 { name: 'Roles', value: `${target.roles.cache.size}`, inline: true },
-                { name: 'Bot', value: target.user.bot ? 'Yes' : 'No', inline: true }
+                { name: 'Bot', value: target.user.bot ? 'Yes' : 'No', inline: true },
+                { name: '⚠️ Warnings', value: `${warningCount}`, inline: true }
             )
             .setTimestamp();
+        
+        if (warnings.length > 0) {
+            const recentWarnings = warnings.slice(0, 5).map(w => 
+                `• ${w.reason} (by ${w.moderator} on <t:${Math.floor(new Date(w.date).getTime() / 1000)}:R>)`
+            ).join('\n');
+            embed.addFields({ name: '📜 Recent Warnings', value: recentWarnings || 'None', inline: false });
+        }
+        
         await message.reply({ embeds: [embed] });
     }
 
@@ -447,7 +569,8 @@ client.on('messageCreate', async (message) => {
             .setTitle('📜 Moderation Logs')
             .setDescription('All moderation actions are logged in the configured log channel.')
             .addFields(
-                { name: 'Tracked Events', value: '• Message Delete\n• Message Edit\n• Member Join/Leave\n• Voice Updates\n• All Mod Actions', inline: false }
+                { name: 'Tracked Events', value: '• Message Delete\n• Message Edit\n• Member Join/Leave\n• Voice Updates\n• All Mod Actions\n• Persistent Warnings (SQLite)', inline: false },
+                { name: 'Database', value: 'SQLite - Warnings persist after bot restart', inline: false }
             )
             .setTimestamp();
         await message.reply({ embeds: [embed] });
@@ -455,7 +578,6 @@ client.on('messageCreate', async (message) => {
 
     // ========== ANN ==========
     else if (command === 'ann') {
-        if (!hasModPermission(member)) return message.reply('❌ You need moderator permissions to use this!');
         const text = args.join(' ');
         if (!text) return message.reply('Usage: `!ann <message>`');
         const embed = new EmbedBuilder()
@@ -465,14 +587,13 @@ client.on('messageCreate', async (message) => {
             .setDescription(text)
             .setTimestamp()
             .setFooter({ text: `Announced by ${message.author.tag}`, iconURL: message.author.displayAvatarURL() });
-        await message.delete();
+        await message.delete().catch(() => {});
         await channel.send({ embeds: [embed] });
         await sendLog(guild, 'ANNOUNCEMENT', { id: 'N/A', tag: 'Channel' }, message.author, text.slice(0, 100));
     }
 
     // ========== ANNI ==========
     else if (command === 'anni') {
-        if (!hasModPermission(member)) return message.reply('❌ You need moderator permissions to use this!');
         const embed = new EmbedBuilder()
             .setColor(0x5865F2)
             .setAuthor({ name: guild.name, iconURL: guild.iconURL() })
@@ -480,7 +601,7 @@ client.on('messageCreate', async (message) => {
             .setImage(ANNI_IMAGE_URL)
             .setTimestamp()
             .setFooter({ text: `Announced by ${message.author.tag}`, iconURL: message.author.displayAvatarURL() });
-        await message.delete();
+        await message.delete().catch(() => {});
         await channel.send({ embeds: [embed] });
         await sendLog(guild, 'ANNOUNCEMENT (Image)', { id: 'N/A', tag: 'Channel' }, message.author, 'Professional announcement image sent');
     }
@@ -489,11 +610,18 @@ client.on('messageCreate', async (message) => {
 // ============================================
 // READY EVENT
 // ============================================
-client.once('ready', () => {
+client.once('ready', async () => {
     console.log(`✅ Logged in as ${client.user.tag}`);
     console.log(`📋 Moderation Bot is ready!`);
     console.log(`👮 Mod Role ID: ${MOD_ROLE_ID || 'Not set (Admin only)'}`);
     console.log(`📝 Log Channel ID: ${LOG_CHANNEL_ID || 'Not set'}`);
+    console.log(`💾 Database: SQLite (warnings.db) - Persistent storage`);
+    
+    // Get warning count
+    db.get(`SELECT COUNT(*) as total FROM warnings`, (err, row) => {
+        console.log(`📊 Total warnings in database: ${row ? row.total : 0}`);
+    });
+    
     console.log(`🚀 Bot is online with 20+ commands!`);
     client.user.setActivity('!help | Moderation Bot', { type: 3 });
 });
@@ -503,6 +631,22 @@ client.once('ready', () => {
 // ============================================
 process.on('unhandledRejection', (error) => console.error('❌ Unhandled rejection:', error.message));
 process.on('uncaughtException', (error) => console.error('❌ Uncaught exception:', error.message));
+
+process.on('SIGINT', () => {
+    console.log('🛑 Shutting down...');
+    db.close(() => {
+        console.log('✅ Database closed');
+        process.exit(0);
+    });
+});
+
+process.on('SIGTERM', () => {
+    console.log('🛑 Shutting down...');
+    db.close(() => {
+        console.log('✅ Database closed');
+        process.exit(0);
+    });
+});
 
 // ============================================
 // START BOT
