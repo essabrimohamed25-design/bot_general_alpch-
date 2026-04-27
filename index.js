@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, EmbedBuilder, PermissionsBitField, ChannelType, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder, PermissionsBitField, ChannelType, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const sqlite3 = require('sqlite3').verbose();
 require('dotenv').config();
 
@@ -8,19 +8,13 @@ require('dotenv').config();
 const db = new sqlite3.Database('./bot_data.db');
 
 db.serialize(() => {
-    // Moderation tables
     db.run(`CREATE TABLE IF NOT EXISTS warnings (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, guild_id TEXT, reason TEXT, moderator TEXT, date TEXT)`);
     db.run(`CREATE TABLE IF NOT EXISTS suggestions (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT, user_id TEXT, suggestion TEXT, status TEXT, date TEXT)`);
     db.run(`CREATE TABLE IF NOT EXISTS giveaways (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT, channel_id TEXT, prize TEXT, winners INTEGER, end_time INTEGER, ended INTEGER DEFAULT 0)`);
-    
-    // Ticket system tables
     db.run(`CREATE TABLE IF NOT EXISTS tickets (user_id TEXT, channel_id TEXT, guild_id TEXT, created_at TEXT, PRIMARY KEY (user_id, guild_id))`);
     db.run(`CREATE TABLE IF NOT EXISTS ticket_config (guild_id TEXT PRIMARY KEY, panel_channel TEXT, category TEXT, log_channel TEXT, support_role TEXT)`);
-    
-    // Reaction role tables
     db.run(`CREATE TABLE IF NOT EXISTS reaction_roles (guild_id TEXT, message_id TEXT, channel_id TEXT, emoji TEXT, role_id TEXT, PRIMARY KEY (guild_id, message_id, emoji))`);
     db.run(`CREATE TABLE IF NOT EXISTS reaction_panels (guild_id TEXT PRIMARY KEY, message_id TEXT, channel_id TEXT)`);
-    
     console.log('✅ Database initialized');
 });
 
@@ -193,13 +187,6 @@ function saveReactionRole(guildId, messageId, channelId, emoji, roleId) {
     });
 }
 
-function saveReactionPanel(guildId, messageId, channelId) {
-    return new Promise((resolve) => {
-        db.run(`INSERT OR REPLACE INTO reaction_panels (guild_id, message_id, channel_id) VALUES (?, ?, ?)`,
-            [guildId, messageId, channelId], () => resolve());
-    });
-}
-
 function getReactionRoles(guildId, messageId) {
     return new Promise((resolve) => {
         db.all(`SELECT * FROM reaction_roles WHERE guild_id = ? AND message_id = ?`, [guildId, messageId], (err, rows) => resolve(rows || []));
@@ -214,7 +201,7 @@ async function createReactionPanel(channel, phoneRoleId, pcRoleId) {
         .addFields(
             { name: '📱 Phone User', value: `<@&${phoneRoleId}>`, inline: true },
             { name: '💻 PC User', value: `<@&${pcRoleId}>`, inline: true },
-            { name: '\u200b', value: 'Click the button corresponding to your device!', inline: false }
+            { name: '\u200b', value: 'Click the button corresponding to your device!\nYou can have both roles!', inline: false }
         )
         .setTimestamp()
         .setFooter({ text: channel.guild.name, iconURL: channel.guild.iconURL() });
@@ -234,11 +221,118 @@ async function createReactionPanel(channel, phoneRoleId, pcRoleId) {
         );
     
     const message = await channel.send({ embeds: [embed], components: [row] });
-    await saveReactionPanel(channel.guild.id, message.id, channel.id);
     await saveReactionRole(channel.guild.id, message.id, channel.id, '📱', phoneRoleId);
     await saveReactionRole(channel.guild.id, message.id, channel.id, '💻', pcRoleId);
     
     return message;
+}
+
+// ============================================
+// TICKET SETUP COLLECTOR (Prefix command friendly)
+// ============================================
+async function startTicketSetup(message) {
+    const filter = (m) => m.author.id === message.author.id;
+    let step = 0;
+    let config = {};
+    
+    const stepMessages = [
+        '📌 Please send the **Channel ID** where the ticket panel should be sent.\n\n*Example: 123456789012345678*',
+        '📌 Please send the **Category ID** where new tickets will be created.\n\n*Example: 123456789012345678*',
+        '📌 Please send the **Log Channel ID** for transcripts and logs.\n\n*Example: 123456789012345678*',
+        '📌 Please send the **Support Role ID** that can view tickets.\n\n*Example: 123456789012345678*'
+    ];
+    
+    const stepNames = ['panel_channel', 'category', 'log_channel', 'support_role'];
+    
+    const sentMsg = await message.reply(stepMessages[0]);
+    
+    const collector = message.channel.createMessageCollector({ filter, time: 60000, max: 4 });
+    
+    collector.on('collect', async (msg) => {
+        const value = msg.content.trim();
+        config[stepNames[step]] = value;
+        step++;
+        
+        if (step < stepMessages.length) {
+            await msg.reply(stepMessages[step]);
+        } else {
+            collector.stop();
+            await saveTicketConfig(message.guild.id, config.panel_channel, config.category, config.log_channel, config.support_role);
+            
+            const embed = new EmbedBuilder()
+                .setColor(0x22C55E)
+                .setTitle('✅ Ticket System Configured')
+                .setDescription('Your ticket system has been successfully configured!')
+                .addFields(
+                    { name: 'Panel Channel', value: `<#${config.panel_channel}>`, inline: true },
+                    { name: 'Category', value: `<#${config.category}>`, inline: true },
+                    { name: 'Log Channel', value: `<#${config.log_channel}>`, inline: true },
+                    { name: 'Support Role', value: `<@&${config.support_role}>`, inline: true }
+                )
+                .setTimestamp();
+            
+            await msg.reply({ embeds: [embed] });
+            await sendLog(message.guild, 'TICKET SETUP', 'System', message.author, 'Ticket system configured');
+        }
+    });
+    
+    collector.on('end', (collected) => {
+        if (collected.size < stepMessages.length && step < stepMessages.length) {
+            message.reply('❌ Setup timed out! Please run !ticketsetup again.');
+        }
+    });
+}
+
+// ============================================
+// REACTION ROLE SETUP COLLECTOR (Prefix command friendly)
+// ============================================
+async function startRoleTestSetup(message) {
+    const filter = (m) => m.author.id === message.author.id;
+    let step = 0;
+    let roles = {};
+    
+    const stepMessages = [
+        '📌 Please send the **Role ID** for **Phone Users**.\n\n*Example: 123456789012345678*',
+        '📌 Please send the **Role ID** for **PC Users**.\n\n*Example: 123456789012345678*'
+    ];
+    
+    const stepNames = ['phone_role', 'pc_role'];
+    
+    const sentMsg = await message.reply(stepMessages[0]);
+    
+    const collector = message.channel.createMessageCollector({ filter, time: 60000, max: 2 });
+    
+    collector.on('collect', async (msg) => {
+        const value = msg.content.trim();
+        roles[stepNames[step]] = value;
+        step++;
+        
+        if (step < stepMessages.length) {
+            await msg.reply(stepMessages[step]);
+        } else {
+            collector.stop();
+            
+            const phoneRole = message.guild.roles.cache.get(roles.phone_role);
+            const pcRole = message.guild.roles.cache.get(roles.pc_role);
+            
+            if (!phoneRole) {
+                return msg.reply('❌ Invalid Phone Role ID! Please run !roltest again.');
+            }
+            if (!pcRole) {
+                return msg.reply('❌ Invalid PC Role ID! Please run !roltest again.');
+            }
+            
+            await createReactionPanel(message.channel, roles.phone_role, roles.pc_role);
+            await msg.reply('✅ Reaction role panel created successfully!');
+            await sendLog(message.guild, 'REACTION ROLE PANEL', 'Channel', message.author, `Phone: ${phoneRole.name}, PC: ${pcRole.name}`);
+        }
+    });
+    
+    collector.on('end', (collected) => {
+        if (collected.size < stepMessages.length && step < stepMessages.length) {
+            message.reply('❌ Setup timed out! Please run !roltest again.');
+        }
+    });
 }
 
 // ============================================
@@ -394,132 +488,106 @@ client.on('messageCreate', async (message) => {
 });
 
 // ============================================
-// INTERACTION HANDLER (Buttons & Modals)
+// INTERACTION HANDLER (Buttons only)
 // ============================================
 client.on('interactionCreate', async (interaction) => {
-    // Button Handler
-    if (interaction.isButton()) {
-        // Reaction roles
-        if (interaction.customId === 'role_phone') {
-            const roles = await getReactionRoles(interaction.guild.id, interaction.message.id);
-            const phoneRole = roles.find(r => r.emoji === '📱');
-            if (phoneRole && phoneRole.role_id) {
-                const role = interaction.guild.roles.cache.get(phoneRole.role_id);
-                if (role) {
-                    if (interaction.member.roles.cache.has(role.id)) {
-                        await interaction.member.roles.remove(role);
-                        await interaction.reply({ content: `✅ Removed ${role.name} role!`, ephemeral: true });
-                    } else {
-                        await interaction.member.roles.add(role);
-                        await interaction.reply({ content: `✅ Added ${role.name} role!`, ephemeral: true });
-                    }
+    if (!interaction.isButton()) return;
+    
+    // Reaction roles buttons
+    if (interaction.customId === 'role_phone') {
+        const roles = await getReactionRoles(interaction.guild.id, interaction.message.id);
+        const phoneRole = roles.find(r => r.emoji === '📱');
+        if (phoneRole && phoneRole.role_id) {
+            const role = interaction.guild.roles.cache.get(phoneRole.role_id);
+            if (role) {
+                if (interaction.member.roles.cache.has(role.id)) {
+                    await interaction.member.roles.remove(role);
+                    await interaction.reply({ content: `✅ Removed ${role.name} role!`, ephemeral: true });
+                } else {
+                    await interaction.member.roles.add(role);
+                    await interaction.reply({ content: `✅ Added ${role.name} role!`, ephemeral: true });
                 }
             }
         }
-        else if (interaction.customId === 'role_pc') {
-            const roles = await getReactionRoles(interaction.guild.id, interaction.message.id);
-            const pcRole = roles.find(r => r.emoji === '💻');
-            if (pcRole && pcRole.role_id) {
-                const role = interaction.guild.roles.cache.get(pcRole.role_id);
-                if (role) {
-                    if (interaction.member.roles.cache.has(role.id)) {
-                        await interaction.member.roles.remove(role);
-                        await interaction.reply({ content: `✅ Removed ${role.name} role!`, ephemeral: true });
-                    } else {
-                        await interaction.member.roles.add(role);
-                        await interaction.reply({ content: `✅ Added ${role.name} role!`, ephemeral: true });
-                    }
+    }
+    else if (interaction.customId === 'role_pc') {
+        const roles = await getReactionRoles(interaction.guild.id, interaction.message.id);
+        const pcRole = roles.find(r => r.emoji === '💻');
+        if (pcRole && pcRole.role_id) {
+            const role = interaction.guild.roles.cache.get(pcRole.role_id);
+            if (role) {
+                if (interaction.member.roles.cache.has(role.id)) {
+                    await interaction.member.roles.remove(role);
+                    await interaction.reply({ content: `✅ Removed ${role.name} role!`, ephemeral: true });
+                } else {
+                    await interaction.member.roles.add(role);
+                    await interaction.reply({ content: `✅ Added ${role.name} role!`, ephemeral: true });
                 }
-            }
-        }
-        
-        // Ticket system buttons
-        else if (interaction.customId === 'create_ticket') {
-            const existing = await getTicket(interaction.user.id, interaction.guild.id);
-            if (existing) return interaction.reply({ content: `❌ You already have an open ticket: <#${existing.channel_id}>`, ephemeral: true });
-            
-            const config = await getTicketConfig(interaction.guild.id);
-            if (!config || !config.category) return interaction.reply({ content: '❌ Ticket system not configured! Ask an admin to use `!ticketsetup`', ephemeral: true });
-            
-            const channel = await interaction.guild.channels.create({
-                name: `ticket-${interaction.user.username}`,
-                type: ChannelType.GuildText,
-                parent: config.category,
-                permissionOverwrites: [
-                    { id: interaction.guild.id, deny: [PermissionsBitField.Flags.ViewChannel] },
-                    { id: interaction.user.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory] },
-                    ...(config.support_role ? [{ id: config.support_role, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory] }] : [])
-                ]
-            });
-            
-            await saveTicket(interaction.user.id, channel.id, interaction.guild.id);
-            
-            const embed = new EmbedBuilder()
-                .setColor(0x5865F2)
-                .setTitle('🎫 Support Ticket')
-                .setDescription('Support team will assist you shortly. Please describe your issue.')
-                .setTimestamp();
-            
-            const row = new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setCustomId('close_ticket').setLabel('Close').setEmoji('🔒').setStyle(ButtonStyle.Danger),
-                new ButtonBuilder().setCustomId('claim_ticket').setLabel('Claim').setEmoji('🎫').setStyle(ButtonStyle.Secondary),
-                new ButtonBuilder().setCustomId('transcript_ticket').setLabel('Transcript').setEmoji('📄').setStyle(ButtonStyle.Secondary)
-            );
-            
-            await channel.send({ content: `${interaction.user}`, embeds: [embed], components: [row] });
-            await interaction.reply({ content: `✅ Ticket created: ${channel}`, ephemeral: true });
-        }
-        
-        else if (interaction.customId === 'close_ticket') {
-            if (!hasPermission(interaction.member)) return interaction.reply({ content: '❌ No permission', ephemeral: true });
-            await deleteTicket(interaction.user.id, interaction.guild.id);
-            await interaction.reply('🔒 Closing ticket in 5 seconds...');
-            setTimeout(async () => { await interaction.channel.delete(); }, 5000);
-        }
-        
-        else if (interaction.customId === 'claim_ticket') {
-            if (!hasPermission(interaction.member)) return interaction.reply({ content: '❌ No permission', ephemeral: true });
-            const embed = new EmbedBuilder().setColor(0x22C55E).setTitle('🎫 Ticket Claimed').setDescription(`${interaction.user} has claimed this ticket.`).setTimestamp();
-            await interaction.reply({ embeds: [embed] });
-        }
-        
-        else if (interaction.customId === 'transcript_ticket') {
-            if (!hasPermission(interaction.member)) return interaction.reply({ content: '❌ No permission', ephemeral: true });
-            const messages = await interaction.channel.messages.fetch({ limit: 100 });
-            const transcript = messages.reverse().map(m => `[${m.createdAt.toLocaleString()}] ${m.author.tag}: ${m.content || '(embed/attachment)'}`).join('\n');
-            const config = await getTicketConfig(interaction.guild.id);
-            const transcriptChannel = interaction.guild.channels.cache.get(config?.log_channel || LOG_CHANNEL_ID);
-            if (transcriptChannel) {
-                const buffer = Buffer.from(transcript, 'utf-8');
-                await transcriptChannel.send({ files: [{ attachment: buffer, name: `transcript-${interaction.channel.name}.txt` }] });
-                await interaction.reply({ content: '📄 Transcript saved!', ephemeral: true });
             }
         }
     }
     
-    // Modal Handler for Ticket Setup
-    if (interaction.isModalSubmit() && interaction.customId === 'ticket_setup_modal') {
-        const panelChannelId = interaction.fields.getTextInputValue('panel_channel');
-        const categoryId = interaction.fields.getTextInputValue('category');
-        const logChannelId = interaction.fields.getTextInputValue('log_channel');
-        const supportRoleId = interaction.fields.getTextInputValue('support_role');
+    // Ticket system buttons
+    else if (interaction.customId === 'create_ticket') {
+        const existing = await getTicket(interaction.user.id, interaction.guild.id);
+        if (existing) return interaction.reply({ content: `❌ You already have an open ticket: <#${existing.channel_id}>`, ephemeral: true });
         
-        await saveTicketConfig(interaction.guild.id, panelChannelId, categoryId, logChannelId, supportRoleId);
+        const config = await getTicketConfig(interaction.guild.id);
+        if (!config || !config.category) return interaction.reply({ content: '❌ Ticket system not configured! Ask an admin to use `!ticketsetup`', ephemeral: true });
+        
+        const channel = await interaction.guild.channels.create({
+            name: `ticket-${interaction.user.username}`,
+            type: ChannelType.GuildText,
+            parent: config.category,
+            permissionOverwrites: [
+                { id: interaction.guild.id, deny: [PermissionsBitField.Flags.ViewChannel] },
+                { id: interaction.user.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory] },
+                ...(config.support_role ? [{ id: config.support_role, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory] }] : [])
+            ]
+        });
+        
+        await saveTicket(interaction.user.id, channel.id, interaction.guild.id);
         
         const embed = new EmbedBuilder()
-            .setColor(0x22C55E)
-            .setTitle('✅ Ticket System Configured')
-            .setDescription('Your ticket system has been successfully configured!')
-            .addFields(
-                { name: 'Panel Channel', value: `<#${panelChannelId}>`, inline: true },
-                { name: 'Category', value: `<#${categoryId}>`, inline: true },
-                { name: 'Log Channel', value: `<#${logChannelId}>`, inline: true },
-                { name: 'Support Role', value: `<@&${supportRoleId}>`, inline: true }
-            )
+            .setColor(0x5865F2)
+            .setTitle('🎫 Support Ticket')
+            .setDescription('Support team will assist you shortly. Please describe your issue.')
             .setTimestamp();
         
-        await interaction.reply({ embeds: [embed], ephemeral: true });
-        await sendLog(interaction.guild, 'TICKET SETUP', 'System', interaction.user, 'Ticket system configured');
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('close_ticket').setLabel('Close').setEmoji('🔒').setStyle(ButtonStyle.Danger),
+            new ButtonBuilder().setCustomId('claim_ticket').setLabel('Claim').setEmoji('🎫').setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId('transcript_ticket').setLabel('Transcript').setEmoji('📄').setStyle(ButtonStyle.Secondary)
+        );
+        
+        await channel.send({ content: `${interaction.user}`, embeds: [embed], components: [row] });
+        await interaction.reply({ content: `✅ Ticket created: ${channel}`, ephemeral: true });
+    }
+    
+    else if (interaction.customId === 'close_ticket') {
+        if (!hasPermission(interaction.member)) return interaction.reply({ content: '❌ No permission', ephemeral: true });
+        await deleteTicket(interaction.user.id, interaction.guild.id);
+        await interaction.reply('🔒 Closing ticket in 5 seconds...');
+        setTimeout(async () => { await interaction.channel.delete(); }, 5000);
+    }
+    
+    else if (interaction.customId === 'claim_ticket') {
+        if (!hasPermission(interaction.member)) return interaction.reply({ content: '❌ No permission', ephemeral: true });
+        const embed = new EmbedBuilder().setColor(0x22C55E).setTitle('🎫 Ticket Claimed').setDescription(`${interaction.user} has claimed this ticket.`).setTimestamp();
+        await interaction.reply({ embeds: [embed] });
+    }
+    
+    else if (interaction.customId === 'transcript_ticket') {
+        if (!hasPermission(interaction.member)) return interaction.reply({ content: '❌ No permission', ephemeral: true });
+        const messages = await interaction.channel.messages.fetch({ limit: 100 });
+        const transcript = messages.reverse().map(m => `[${m.createdAt.toLocaleString()}] ${m.author.tag}: ${m.content || '(embed/attachment)'}`).join('\n');
+        const config = await getTicketConfig(interaction.guild.id);
+        const transcriptChannel = interaction.guild.channels.cache.get(config?.log_channel || LOG_CHANNEL_ID);
+        if (transcriptChannel) {
+            const buffer = Buffer.from(transcript, 'utf-8');
+            await transcriptChannel.send({ files: [{ attachment: buffer, name: `transcript-${interaction.channel.name}.txt` }] });
+            await interaction.reply({ content: '📄 Transcript saved!', ephemeral: true });
+        }
     }
 });
 
@@ -571,50 +639,9 @@ client.on('messageCreate', async (message) => {
         return message.reply({ embeds: [embed] });
     }
     
-    // ========== TICKET SETUP (Step by Step Modal) ==========
+    // ========== TICKET SETUP (Using Collector) ==========
     if (cmd === 'ticketsetup') {
-        const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
-        
-        const modal = new ModalBuilder()
-            .setCustomId('ticket_setup_modal')
-            .setTitle('Ticket System Setup');
-        
-        const panelChannelInput = new TextInputBuilder()
-            .setCustomId('panel_channel')
-            .setLabel('Panel Channel ID')
-            .setStyle(TextInputStyle.Short)
-            .setPlaceholder('Enter the channel ID where ticket panel will be sent')
-            .setRequired(true);
-        
-        const categoryInput = new TextInputBuilder()
-            .setCustomId('category')
-            .setLabel('Ticket Category ID')
-            .setStyle(TextInputStyle.Short)
-            .setPlaceholder('Enter the category ID for new tickets')
-            .setRequired(true);
-        
-        const logChannelInput = new TextInputBuilder()
-            .setCustomId('log_channel')
-            .setLabel('Log Channel ID')
-            .setStyle(TextInputStyle.Short)
-            .setPlaceholder('Enter the channel ID for transcripts/logs')
-            .setRequired(true);
-        
-        const supportRoleInput = new TextInputBuilder()
-            .setCustomId('support_role')
-            .setLabel('Support Role ID')
-            .setStyle(TextInputStyle.Short)
-            .setPlaceholder('Enter the role ID that can see tickets')
-            .setRequired(true);
-        
-        modal.addComponents(
-            new ActionRowBuilder().addComponents(panelChannelInput),
-            new ActionRowBuilder().addComponents(categoryInput),
-            new ActionRowBuilder().addComponents(logChannelInput),
-            new ActionRowBuilder().addComponents(supportRoleInput)
-        );
-        
-        await message.showModal(modal);
+        await startTicketSetup(message);
     }
     
     // ========== TICKET PANEL ==========
@@ -630,58 +657,13 @@ client.on('messageCreate', async (message) => {
         await sendLog(guild, 'TICKET PANEL', 'Channel', member.user, 'Ticket panel sent');
     }
     
-    // ========== REACTION ROLE SETUP ==========
+    // ========== REACTION ROLE SETUP (Using Collector) ==========
     else if (cmd === 'roltest') {
-        const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
-        
-        const modal = new ModalBuilder()
-            .setCustomId('roltest_modal')
-            .setTitle('Reaction Role Setup');
-        
-        const phoneRoleInput = new TextInputBuilder()
-            .setCustomId('phone_role')
-            .setLabel('Phone User Role ID')
-            .setStyle(TextInputStyle.Short)
-            .setPlaceholder('Enter the role ID for phone users')
-            .setRequired(true);
-        
-        const pcRoleInput = new TextInputBuilder()
-            .setCustomId('pc_role')
-            .setLabel('PC User Role ID')
-            .setStyle(TextInputStyle.Short)
-            .setPlaceholder('Enter the role ID for PC users')
-            .setRequired(true);
-        
-        modal.addComponents(
-            new ActionRowBuilder().addComponents(phoneRoleInput),
-            new ActionRowBuilder().addComponents(pcRoleInput)
-        );
-        
-        await message.showModal(modal);
+        await startRoleTestSetup(message);
     }
     
-    // ========== REACTION ROLE MODAL HANDLER ==========
-    client.on('interactionCreate', async (interaction) => {
-        if (!interaction.isModalSubmit()) return;
-        
-        if (interaction.customId === 'roltest_modal') {
-            const phoneRoleId = interaction.fields.getTextInputValue('phone_role');
-            const pcRoleId = interaction.fields.getTextInputValue('pc_role');
-            
-            const phoneRole = interaction.guild.roles.cache.get(phoneRoleId);
-            const pcRole = interaction.guild.roles.cache.get(pcRoleId);
-            
-            if (!phoneRole) return interaction.reply({ content: '❌ Invalid Phone Role ID!', ephemeral: true });
-            if (!pcRole) return interaction.reply({ content: '❌ Invalid PC Role ID!', ephemeral: true });
-            
-            await createReactionPanel(interaction.channel, phoneRoleId, pcRoleId);
-            await interaction.reply({ content: '✅ Reaction role panel created!', ephemeral: true });
-            await sendLog(interaction.guild, 'REACTION ROLE PANEL', 'Channel', interaction.user, `Phone: ${phoneRole.name}, PC: ${pcRole.name}`);
-        }
-    });
-    
     // ========== BAN ==========
-    if (cmd === 'ban') {
+    else if (cmd === 'ban') {
         const id = args[0];
         if (!id) return message.reply('Usage: `!ban <userID> [reason]`');
         const target = await getMember(guild, id);
