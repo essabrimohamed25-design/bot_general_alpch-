@@ -1,11 +1,10 @@
 {
-  "name": "premium-discord-bot",
+  "name": "premium-moderation-bot",
   "version": "1.0.0",
-  "description": "Premium Discord bot with slash commands, ticket system, and advanced moderation",
+  "description": "Professional Discord moderation bot with prefix commands",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "deploy": "node deploy.js"
+    "start": "node index.js"
   },
   "dependencies": {
     "discord.js": "^14.14.1",
