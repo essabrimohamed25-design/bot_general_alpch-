@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, EmbedBuilder, PermissionsBitField, ChannelType, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder, PermissionsBitField, ChannelType, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType } = require('discord.js');
 const sqlite3 = require('sqlite3').verbose();
 require('dotenv').config();
 
@@ -8,11 +8,19 @@ require('dotenv').config();
 const db = new sqlite3.Database('./bot_data.db');
 
 db.serialize(() => {
+    // Moderation tables
     db.run(`CREATE TABLE IF NOT EXISTS warnings (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, guild_id TEXT, reason TEXT, moderator TEXT, date TEXT)`);
     db.run(`CREATE TABLE IF NOT EXISTS suggestions (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT, user_id TEXT, suggestion TEXT, status TEXT, date TEXT)`);
     db.run(`CREATE TABLE IF NOT EXISTS giveaways (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT, channel_id TEXT, prize TEXT, winners INTEGER, end_time INTEGER, ended INTEGER DEFAULT 0)`);
+    
+    // Ticket system tables
     db.run(`CREATE TABLE IF NOT EXISTS tickets (user_id TEXT, channel_id TEXT, guild_id TEXT, created_at TEXT, PRIMARY KEY (user_id, guild_id))`);
-    db.run(`CREATE TABLE IF NOT EXISTS ticket_config (guild_id TEXT PRIMARY KEY, category TEXT, support_role TEXT, transcript_channel TEXT)`);
+    db.run(`CREATE TABLE IF NOT EXISTS ticket_config (guild_id TEXT PRIMARY KEY, panel_channel TEXT, category TEXT, log_channel TEXT, support_role TEXT)`);
+    
+    // Reaction role tables
+    db.run(`CREATE TABLE IF NOT EXISTS reaction_roles (guild_id TEXT, message_id TEXT, channel_id TEXT, emoji TEXT, role_id TEXT, PRIMARY KEY (guild_id, message_id, emoji))`);
+    db.run(`CREATE TABLE IF NOT EXISTS reaction_panels (guild_id TEXT PRIMARY KEY, message_id TEXT, channel_id TEXT)`);
+    
     console.log('✅ Database initialized');
 });
 
@@ -43,7 +51,7 @@ const client = new Client({
 // ============================================
 const userMessages = new Map();
 const activeGiveaways = new Map();
-const cooldowns = new Map();
+const setupSessions = new Map();
 
 // ============================================
 // HELPER FUNCTIONS
@@ -119,10 +127,13 @@ function getWarnings(userId, guildId) {
     });
 }
 
-function saveTicketConfig(guildId, category, supportRole, transcriptChannel) {
+// ============================================
+// TICKET SYSTEM FUNCTIONS
+// ============================================
+function saveTicketConfig(guildId, panelChannel, category, logChannel, supportRole) {
     return new Promise((resolve) => {
-        db.run(`INSERT OR REPLACE INTO ticket_config (guild_id, category, support_role, transcript_channel) VALUES (?, ?, ?, ?)`,
-            [guildId, category, supportRole, transcriptChannel], () => resolve());
+        db.run(`INSERT OR REPLACE INTO ticket_config (guild_id, panel_channel, category, log_channel, support_role) VALUES (?, ?, ?, ?, ?)`,
+            [guildId, panelChannel, category, logChannel, supportRole], () => resolve());
     });
 }
 
@@ -151,14 +162,125 @@ function deleteTicket(userId, guildId) {
     });
 }
 
-function saveSuggestion(messageId, userId, suggestion) {
-    db.run(`INSERT INTO suggestions (message_id, user_id, suggestion, date) VALUES (?, ?, ?, ?)`,
-        [messageId, userId, suggestion, new Date().toISOString()]);
+async function createTicketPanel(channel, config) {
+    const embed = new EmbedBuilder()
+        .setColor(0x5865F2)
+        .setTitle('🎫 SUPPORT TICKET SYSTEM')
+        .setDescription('Click the button below to create a support ticket. Our team will assist you as soon as possible.')
+        .setTimestamp()
+        .setFooter({ text: channel.guild.name, iconURL: channel.guild.iconURL() });
+    
+    const row = new ActionRowBuilder()
+        .addComponents(
+            new ButtonBuilder()
+                .setCustomId('create_ticket')
+                .setLabel('Open Ticket')
+                .setEmoji('🎫')
+                .setStyle(ButtonStyle.Primary)
+        );
+    
+    const message = await channel.send({ embeds: [embed], components: [row] });
+    return message;
 }
 
-function saveGiveaway(messageId, channelId, prize, winners, endTime) {
-    db.run(`INSERT INTO giveaways (message_id, channel_id, prize, winners, end_time) VALUES (?, ?, ?, ?, ?)`,
-        [messageId, channelId, prize, winners, endTime]);
+// ============================================
+// REACTION ROLE FUNCTIONS
+// ============================================
+function saveReactionRole(guildId, messageId, channelId, emoji, roleId) {
+    return new Promise((resolve) => {
+        db.run(`INSERT OR REPLACE INTO reaction_roles (guild_id, message_id, channel_id, emoji, role_id) VALUES (?, ?, ?, ?, ?)`,
+            [guildId, messageId, channelId, emoji, roleId], () => resolve());
+    });
+}
+
+function saveReactionPanel(guildId, messageId, channelId) {
+    return new Promise((resolve) => {
+        db.run(`INSERT OR REPLACE INTO reaction_panels (guild_id, message_id, channel_id) VALUES (?, ?, ?)`,
+            [guildId, messageId, channelId], () => resolve());
+    });
+}
+
+function getReactionRoles(guildId, messageId) {
+    return new Promise((resolve) => {
+        db.all(`SELECT * FROM reaction_roles WHERE guild_id = ? AND message_id = ?`, [guildId, messageId], (err, rows) => resolve(rows || []));
+    });
+}
+
+async function createReactionPanel(channel, phoneRoleId, pcRoleId) {
+    const embed = new EmbedBuilder()
+        .setColor(0x5865F2)
+        .setTitle('📱 DEVICE ROLES')
+        .setDescription('Click the buttons below to get your device role!')
+        .addFields(
+            { name: '📱 Phone User', value: `<@&${phoneRoleId}>`, inline: true },
+            { name: '💻 PC User', value: `<@&${pcRoleId}>`, inline: true },
+            { name: '\u200b', value: 'Click the button corresponding to your device!', inline: false }
+        )
+        .setTimestamp()
+        .setFooter({ text: channel.guild.name, iconURL: channel.guild.iconURL() });
+    
+    const row = new ActionRowBuilder()
+        .addComponents(
+            new ButtonBuilder()
+                .setCustomId('role_phone')
+                .setLabel('Phone User')
+                .setEmoji('📱')
+                .setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder()
+                .setCustomId('role_pc')
+                .setLabel('PC User')
+                .setEmoji('💻')
+                .setStyle(ButtonStyle.Secondary)
+        );
+    
+    const message = await channel.send({ embeds: [embed], components: [row] });
+    await saveReactionPanel(channel.guild.id, message.id, channel.id);
+    await saveReactionRole(channel.guild.id, message.id, channel.id, '📱', phoneRoleId);
+    await saveReactionRole(channel.guild.id, message.id, channel.id, '💻', pcRoleId);
+    
+    return message;
+}
+
+// ============================================
+// ANNOUNCEMENT FUNCTIONS
+// ============================================
+async function sendProfessionalAnnouncement(channel, message) {
+    const embed = new EmbedBuilder()
+        .setColor(0x5865F2)
+        .setTitle('📢 ANNOUNCEMENT')
+        .setDescription(message)
+        .setThumbnail(channel.guild.iconURL())
+        .setTimestamp()
+        .setFooter({ text: channel.guild.name, iconURL: channel.guild.iconURL() });
+    await channel.send({ embeds: [embed] });
+}
+
+async function sendWelcomeAnnouncement(channel) {
+    const embed = new EmbedBuilder()
+        .setColor(0x5865F2)
+        .setTitle(`🌟 WELCOME TO ${channel.guild.name.toUpperCase()} 🌟`)
+        .setDescription(`> **Thank you for joining our community!**\n> We're excited to have you here.\n`)
+        .setThumbnail(channel.guild.iconURL())
+        .setImage(WELCOME_IMAGE_URL || 'https://media.discordapp.net/attachments/1462437612647088335/1482006389843824670/content.png')
+        .addFields(
+            { name: '━━━━━━━━━━━━━━━━━━━━━━━━━━━━', value: ' ', inline: false },
+            { name: '📢 │ ANNOUNCEMENTS', value: '> Stay updated with server news and events', inline: false },
+            { name: '━━━━━━━━━━━━━━━━━━━━━━━━━━━━', value: ' ', inline: false },
+            { name: '📜 │ RULES', value: '> Please read our rules to keep the community safe', inline: false },
+            { name: '━━━━━━━━━━━━━━━━━━━━━━━━━━━━', value: ' ', inline: false },
+            { name: '🎭 │ SELF ROLES', value: '> Get your roles using !roltest', inline: false },
+            { name: '━━━━━━━━━━━━━━━━━━━━━━━━━━━━', value: ' ', inline: false },
+            { name: '📋 │ APPLY TEAM', value: '> Interested in joining our team? Use !ticket', inline: false },
+            { name: '━━━━━━━━━━━━━━━━━━━━━━━━━━━━', value: ' ', inline: false },
+            { name: '💬 │ GENERAL', value: '> Chat with the community', inline: false },
+            { name: '━━━━━━━━━━━━━━━━━━━━━━━━━━━━', value: ' ', inline: false },
+            { name: '🔧 │ COMMANDS', value: '> Use !help to see all commands\n> Use !suggest to share ideas\n> Use !ticket for support', inline: false },
+            { name: '━━━━━━━━━━━━━━━━━━━━━━━━━━━━', value: ' ', inline: false },
+            { name: '🎤 │ VOICE', value: '> Connect with members in voice channels', inline: false }
+        )
+        .setTimestamp()
+        .setFooter({ text: `${channel.guild.name} • Welcome!`, iconURL: channel.guild.iconURL() });
+    await channel.send({ embeds: [embed] });
 }
 
 // ============================================
@@ -177,6 +299,19 @@ function checkSpam(userId, channelId) {
 
 function containsLink(content) {
     return /(https?:\/\/[^\s]+|discord\.gg\/[^\s]+|www\.[^\s]+)/gi.test(content);
+}
+
+// ============================================
+// SUGGESTION & GIVEAWAY FUNCTIONS
+// ============================================
+function saveSuggestion(messageId, userId, suggestion) {
+    db.run(`INSERT INTO suggestions (message_id, user_id, suggestion, date) VALUES (?, ?, ?, ?)`,
+        [messageId, userId, suggestion, new Date().toISOString()]);
+}
+
+function saveGiveaway(messageId, channelId, prize, winners, endTime) {
+    db.run(`INSERT INTO giveaways (message_id, channel_id, prize, winners, end_time) VALUES (?, ?, ?, ?, ?)`,
+        [messageId, channelId, prize, winners, endTime]);
 }
 
 // ============================================
@@ -259,147 +394,132 @@ client.on('messageCreate', async (message) => {
 });
 
 // ============================================
-// TICKET FUNCTIONS
-// ============================================
-async function createTicketPanel(channel) {
-    const config = await getTicketConfig(channel.guild.id);
-    if (!config) return channel.send('❌ Ticket system not configured! Ask an admin to use `!ticketsetup`');
-    
-    const embed = new EmbedBuilder()
-        .setColor(0x5865F2)
-        .setTitle('🎫 SUPPORT TICKET SYSTEM')
-        .setDescription('Click the button below to create a support ticket. Our team will assist you as soon as possible.')
-        .setTimestamp()
-        .setFooter({ text: channel.guild.name, iconURL: channel.guild.iconURL() });
-    
-    const row = new ActionRowBuilder()
-        .addComponents(
-            new ButtonBuilder()
-                .setCustomId('create_ticket')
-                .setLabel('Open Ticket')
-                .setEmoji('🎫')
-                .setStyle(ButtonStyle.Primary)
-        );
-    
-    await channel.send({ embeds: [embed], components: [row] });
-}
-
-async function sendProfessionalAnnouncement(channel, message) {
-    const embed = new EmbedBuilder()
-        .setColor(0x5865F2)
-        .setTitle('📢 ANNOUNCEMENT')
-        .setDescription(message)
-        .setThumbnail(channel.guild.iconURL())
-        .setTimestamp()
-        .setFooter({ text: channel.guild.name, iconURL: channel.guild.iconURL() });
-    await channel.send({ embeds: [embed] });
-}
-
-async function sendWelcomeAnnouncement(channel) {
-    const embed = new EmbedBuilder()
-        .setColor(0x5865F2)
-        .setTitle(`🌟 WELCOME TO ${channel.guild.name.toUpperCase()} 🌟`)
-        .setDescription(`> **Thank you for joining our community!**\n> We're excited to have you here.\n`)
-        .setThumbnail(channel.guild.iconURL())
-        .setImage(WELCOME_IMAGE_URL || 'https://media.discordapp.net/attachments/1462437612647088335/1482006389843824670/content.png')
-        .addFields(
-            { name: '━━━━━━━━━━━━━━━━━━━━━━━━━━━━', value: ' ', inline: false },
-            { name: '📢 │ ANNOUNCEMENTS', value: '> Stay updated with server news and events', inline: false },
-            { name: '━━━━━━━━━━━━━━━━━━━━━━━━━━━━', value: ' ', inline: false },
-            { name: '📜 │ RULES', value: '> Please read our rules to keep the community safe', inline: false },
-            { name: '━━━━━━━━━━━━━━━━━━━━━━━━━━━━', value: ' ', inline: false },
-            { name: '🎭 │ SELF ROLES', value: '> Get your roles to unlock channels', inline: false },
-            { name: '━━━━━━━━━━━━━━━━━━━━━━━━━━━━', value: ' ', inline: false },
-            { name: '📋 │ APPLY TEAM', value: '> Interested in joining our team? Apply today!', inline: false },
-            { name: '━━━━━━━━━━━━━━━━━━━━━━━━━━━━', value: ' ', inline: false },
-            { name: '💬 │ GENERAL', value: '> Chat with the community', inline: false },
-            { name: '━━━━━━━━━━━━━━━━━━━━━━━━━━━━', value: ' ', inline: false },
-            { name: '🔧 │ COMMANDS', value: '> Use !help to see all commands\n> Use !suggest to share ideas\n> Use !ticket for support', inline: false },
-            { name: '━━━━━━━━━━━━━━━━━━━━━━━━━━━━', value: ' ', inline: false },
-            { name: '🎤 │ VOICE', value: '> Connect with members in voice channels', inline: false }
-        )
-        .setTimestamp()
-        .setFooter({ text: `${channel.guild.name} • Welcome!`, iconURL: channel.guild.iconURL() });
-    await channel.send({ embeds: [embed] });
-}
-
-// ============================================
-// READY EVENT
-// ============================================
-client.once('ready', () => {
-    console.log(`✅ ${client.user.tag} is online!`);
-    console.log(`📋 Prefix: !`);
-    console.log(`👮 Mod Role ID: ${MOD_ROLE_ID || 'Not set (admin only)'}`);
-    console.log(`📝 Log Channel ID: ${LOG_CHANNEL_ID || 'Not set'}`);
-    client.user.setActivity('!help | Premium Bot', { type: 3 });
-});
-
-// ============================================
-// BUTTON HANDLER
+// INTERACTION HANDLER (Buttons & Modals)
 // ============================================
 client.on('interactionCreate', async (interaction) => {
-    if (!interaction.isButton()) return;
+    // Button Handler
+    if (interaction.isButton()) {
+        // Reaction roles
+        if (interaction.customId === 'role_phone') {
+            const roles = await getReactionRoles(interaction.guild.id, interaction.message.id);
+            const phoneRole = roles.find(r => r.emoji === '📱');
+            if (phoneRole && phoneRole.role_id) {
+                const role = interaction.guild.roles.cache.get(phoneRole.role_id);
+                if (role) {
+                    if (interaction.member.roles.cache.has(role.id)) {
+                        await interaction.member.roles.remove(role);
+                        await interaction.reply({ content: `✅ Removed ${role.name} role!`, ephemeral: true });
+                    } else {
+                        await interaction.member.roles.add(role);
+                        await interaction.reply({ content: `✅ Added ${role.name} role!`, ephemeral: true });
+                    }
+                }
+            }
+        }
+        else if (interaction.customId === 'role_pc') {
+            const roles = await getReactionRoles(interaction.guild.id, interaction.message.id);
+            const pcRole = roles.find(r => r.emoji === '💻');
+            if (pcRole && pcRole.role_id) {
+                const role = interaction.guild.roles.cache.get(pcRole.role_id);
+                if (role) {
+                    if (interaction.member.roles.cache.has(role.id)) {
+                        await interaction.member.roles.remove(role);
+                        await interaction.reply({ content: `✅ Removed ${role.name} role!`, ephemeral: true });
+                    } else {
+                        await interaction.member.roles.add(role);
+                        await interaction.reply({ content: `✅ Added ${role.name} role!`, ephemeral: true });
+                    }
+                }
+            }
+        }
+        
+        // Ticket system buttons
+        else if (interaction.customId === 'create_ticket') {
+            const existing = await getTicket(interaction.user.id, interaction.guild.id);
+            if (existing) return interaction.reply({ content: `❌ You already have an open ticket: <#${existing.channel_id}>`, ephemeral: true });
+            
+            const config = await getTicketConfig(interaction.guild.id);
+            if (!config || !config.category) return interaction.reply({ content: '❌ Ticket system not configured! Ask an admin to use `!ticketsetup`', ephemeral: true });
+            
+            const channel = await interaction.guild.channels.create({
+                name: `ticket-${interaction.user.username}`,
+                type: ChannelType.GuildText,
+                parent: config.category,
+                permissionOverwrites: [
+                    { id: interaction.guild.id, deny: [PermissionsBitField.Flags.ViewChannel] },
+                    { id: interaction.user.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory] },
+                    ...(config.support_role ? [{ id: config.support_role, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory] }] : [])
+                ]
+            });
+            
+            await saveTicket(interaction.user.id, channel.id, interaction.guild.id);
+            
+            const embed = new EmbedBuilder()
+                .setColor(0x5865F2)
+                .setTitle('🎫 Support Ticket')
+                .setDescription('Support team will assist you shortly. Please describe your issue.')
+                .setTimestamp();
+            
+            const row = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId('close_ticket').setLabel('Close').setEmoji('🔒').setStyle(ButtonStyle.Danger),
+                new ButtonBuilder().setCustomId('claim_ticket').setLabel('Claim').setEmoji('🎫').setStyle(ButtonStyle.Secondary),
+                new ButtonBuilder().setCustomId('transcript_ticket').setLabel('Transcript').setEmoji('📄').setStyle(ButtonStyle.Secondary)
+            );
+            
+            await channel.send({ content: `${interaction.user}`, embeds: [embed], components: [row] });
+            await interaction.reply({ content: `✅ Ticket created: ${channel}`, ephemeral: true });
+        }
+        
+        else if (interaction.customId === 'close_ticket') {
+            if (!hasPermission(interaction.member)) return interaction.reply({ content: '❌ No permission', ephemeral: true });
+            await deleteTicket(interaction.user.id, interaction.guild.id);
+            await interaction.reply('🔒 Closing ticket in 5 seconds...');
+            setTimeout(async () => { await interaction.channel.delete(); }, 5000);
+        }
+        
+        else if (interaction.customId === 'claim_ticket') {
+            if (!hasPermission(interaction.member)) return interaction.reply({ content: '❌ No permission', ephemeral: true });
+            const embed = new EmbedBuilder().setColor(0x22C55E).setTitle('🎫 Ticket Claimed').setDescription(`${interaction.user} has claimed this ticket.`).setTimestamp();
+            await interaction.reply({ embeds: [embed] });
+        }
+        
+        else if (interaction.customId === 'transcript_ticket') {
+            if (!hasPermission(interaction.member)) return interaction.reply({ content: '❌ No permission', ephemeral: true });
+            const messages = await interaction.channel.messages.fetch({ limit: 100 });
+            const transcript = messages.reverse().map(m => `[${m.createdAt.toLocaleString()}] ${m.author.tag}: ${m.content || '(embed/attachment)'}`).join('\n');
+            const config = await getTicketConfig(interaction.guild.id);
+            const transcriptChannel = interaction.guild.channels.cache.get(config?.log_channel || LOG_CHANNEL_ID);
+            if (transcriptChannel) {
+                const buffer = Buffer.from(transcript, 'utf-8');
+                await transcriptChannel.send({ files: [{ attachment: buffer, name: `transcript-${interaction.channel.name}.txt` }] });
+                await interaction.reply({ content: '📄 Transcript saved!', ephemeral: true });
+            }
+        }
+    }
     
-    if (interaction.customId === 'create_ticket') {
-        const existing = await getTicket(interaction.user.id, interaction.guild.id);
-        if (existing) return interaction.reply({ content: `❌ You already have an open ticket: <#${existing.channel_id}>`, ephemeral: true });
+    // Modal Handler for Ticket Setup
+    if (interaction.isModalSubmit() && interaction.customId === 'ticket_setup_modal') {
+        const panelChannelId = interaction.fields.getTextInputValue('panel_channel');
+        const categoryId = interaction.fields.getTextInputValue('category');
+        const logChannelId = interaction.fields.getTextInputValue('log_channel');
+        const supportRoleId = interaction.fields.getTextInputValue('support_role');
         
-        const config = await getTicketConfig(interaction.guild.id);
-        if (!config || !config.category) return interaction.reply({ content: '❌ Ticket system not configured!', ephemeral: true });
-        
-        const channel = await interaction.guild.channels.create({
-            name: `ticket-${interaction.user.username}`,
-            type: ChannelType.GuildText,
-            parent: config.category,
-            permissionOverwrites: [
-                { id: interaction.guild.id, deny: [PermissionsBitField.Flags.ViewChannel] },
-                { id: interaction.user.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory] },
-                ...(config.support_role ? [{ id: config.support_role, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory] }] : [])
-            ]
-        });
-        
-        await saveTicket(interaction.user.id, channel.id, interaction.guild.id);
+        await saveTicketConfig(interaction.guild.id, panelChannelId, categoryId, logChannelId, supportRoleId);
         
         const embed = new EmbedBuilder()
-            .setColor(0x5865F2)
-            .setTitle('🎫 Support Ticket')
-            .setDescription('Support team will assist you shortly. Please describe your issue.')
+            .setColor(0x22C55E)
+            .setTitle('✅ Ticket System Configured')
+            .setDescription('Your ticket system has been successfully configured!')
+            .addFields(
+                { name: 'Panel Channel', value: `<#${panelChannelId}>`, inline: true },
+                { name: 'Category', value: `<#${categoryId}>`, inline: true },
+                { name: 'Log Channel', value: `<#${logChannelId}>`, inline: true },
+                { name: 'Support Role', value: `<@&${supportRoleId}>`, inline: true }
+            )
             .setTimestamp();
         
-        const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId('close_ticket').setLabel('Close').setEmoji('🔒').setStyle(ButtonStyle.Danger),
-            new ButtonBuilder().setCustomId('claim_ticket').setLabel('Claim').setEmoji('🎫').setStyle(ButtonStyle.Secondary),
-            new ButtonBuilder().setCustomId('transcript_ticket').setLabel('Transcript').setEmoji('📄').setStyle(ButtonStyle.Secondary)
-        );
-        
-        await channel.send({ content: `${interaction.user}`, embeds: [embed], components: [row] });
-        await interaction.reply({ content: `✅ Ticket created: ${channel}`, ephemeral: true });
-    }
-    
-    else if (interaction.customId === 'close_ticket') {
-        if (!hasPermission(interaction.member)) return interaction.reply({ content: '❌ No permission', ephemeral: true });
-        await deleteTicket(interaction.user.id, interaction.guild.id);
-        await interaction.reply('🔒 Closing ticket in 5 seconds...');
-        setTimeout(async () => { await interaction.channel.delete(); }, 5000);
-    }
-    
-    else if (interaction.customId === 'claim_ticket') {
-        if (!hasPermission(interaction.member)) return interaction.reply({ content: '❌ No permission', ephemeral: true });
-        const embed = new EmbedBuilder().setColor(0x22C55E).setTitle('🎫 Ticket Claimed').setDescription(`${interaction.user} has claimed this ticket.`).setTimestamp();
-        await interaction.reply({ embeds: [embed] });
-    }
-    
-    else if (interaction.customId === 'transcript_ticket') {
-        if (!hasPermission(interaction.member)) return interaction.reply({ content: '❌ No permission', ephemeral: true });
-        const messages = await interaction.channel.messages.fetch({ limit: 100 });
-        const transcript = messages.reverse().map(m => `[${m.createdAt.toLocaleString()}] ${m.author.tag}: ${m.content || '(embed/attachment)'}`).join('\n');
-        const config = await getTicketConfig(interaction.guild.id);
-        const transcriptChannel = interaction.guild.channels.cache.get(config?.transcript_channel || LOG_CHANNEL_ID);
-        if (transcriptChannel) {
-            const buffer = Buffer.from(transcript, 'utf-8');
-            await transcriptChannel.send({ files: [{ attachment: buffer, name: `transcript-${interaction.channel.name}.txt` }] });
-            await interaction.reply({ content: '📄 Transcript saved!', ephemeral: true });
-        }
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+        await sendLog(interaction.guild, 'TICKET SETUP', 'System', interaction.user, 'Ticket system configured');
     }
 });
 
@@ -415,7 +535,7 @@ client.on('messageCreate', async (message) => {
     const { member, guild, channel } = message;
     
     // Permission check for mod commands
-    const modCmds = ['ban', 'kick', 'mute', 'unmute', 'warn', 'clear', 'lock', 'unlock', 'giverole', 'removerole', 'unban', 'ann', 'anni', 'ticketsetup', 'ticket', 'giveaway'];
+    const modCmds = ['ban', 'kick', 'mute', 'unmute', 'warn', 'clear', 'lock', 'unlock', 'giverole', 'removerole', 'unban', 'ann', 'anni', 'ticketsetup', 'ticket', 'giveaway', 'roltest'];
     if (modCmds.includes(cmd) && !hasPermission(member)) {
         return message.reply('❌ You need moderator permissions!');
     }
@@ -441,14 +561,124 @@ client.on('messageCreate', async (message) => {
                 { name: '!avatar [id]', value: 'User avatar', inline: true },
                 { name: '!ann <msg>', value: 'Send announcement', inline: true },
                 { name: '!anni', value: 'Welcome announcement', inline: true },
+                { name: '!ticketsetup', value: 'Setup ticket system (step by step)', inline: true },
                 { name: '!ticket', value: 'Send ticket panel', inline: true },
-                { name: '!ticketsetup <categoryID> <roleID> <transcriptID>', value: 'Setup ticket system', inline: true },
+                { name: '!roltest', value: 'Setup reaction role panel', inline: true },
                 { name: '!suggest <msg>', value: 'Submit suggestion', inline: true },
                 { name: '!giveaway <prize> <minutes> <winners>', value: 'Start giveaway', inline: true }
             )
             .setFooter({ text: 'Requires mod role or admin' }).setTimestamp();
         return message.reply({ embeds: [embed] });
     }
+    
+    // ========== TICKET SETUP (Step by Step Modal) ==========
+    if (cmd === 'ticketsetup') {
+        const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+        
+        const modal = new ModalBuilder()
+            .setCustomId('ticket_setup_modal')
+            .setTitle('Ticket System Setup');
+        
+        const panelChannelInput = new TextInputBuilder()
+            .setCustomId('panel_channel')
+            .setLabel('Panel Channel ID')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('Enter the channel ID where ticket panel will be sent')
+            .setRequired(true);
+        
+        const categoryInput = new TextInputBuilder()
+            .setCustomId('category')
+            .setLabel('Ticket Category ID')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('Enter the category ID for new tickets')
+            .setRequired(true);
+        
+        const logChannelInput = new TextInputBuilder()
+            .setCustomId('log_channel')
+            .setLabel('Log Channel ID')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('Enter the channel ID for transcripts/logs')
+            .setRequired(true);
+        
+        const supportRoleInput = new TextInputBuilder()
+            .setCustomId('support_role')
+            .setLabel('Support Role ID')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('Enter the role ID that can see tickets')
+            .setRequired(true);
+        
+        modal.addComponents(
+            new ActionRowBuilder().addComponents(panelChannelInput),
+            new ActionRowBuilder().addComponents(categoryInput),
+            new ActionRowBuilder().addComponents(logChannelInput),
+            new ActionRowBuilder().addComponents(supportRoleInput)
+        );
+        
+        await message.showModal(modal);
+    }
+    
+    // ========== TICKET PANEL ==========
+    else if (cmd === 'ticket') {
+        const config = await getTicketConfig(guild.id);
+        if (!config) return message.reply('❌ Ticket system not configured! Use `!ticketsetup` first.');
+        
+        const panelChannel = guild.channels.cache.get(config.panel_channel);
+        if (!panelChannel) return message.reply('❌ Panel channel not found! Please reconfigure.');
+        
+        await createTicketPanel(panelChannel, config);
+        await message.reply(`✅ Ticket panel sent to ${panelChannel}`);
+        await sendLog(guild, 'TICKET PANEL', 'Channel', member.user, 'Ticket panel sent');
+    }
+    
+    // ========== REACTION ROLE SETUP ==========
+    else if (cmd === 'roltest') {
+        const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+        
+        const modal = new ModalBuilder()
+            .setCustomId('roltest_modal')
+            .setTitle('Reaction Role Setup');
+        
+        const phoneRoleInput = new TextInputBuilder()
+            .setCustomId('phone_role')
+            .setLabel('Phone User Role ID')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('Enter the role ID for phone users')
+            .setRequired(true);
+        
+        const pcRoleInput = new TextInputBuilder()
+            .setCustomId('pc_role')
+            .setLabel('PC User Role ID')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('Enter the role ID for PC users')
+            .setRequired(true);
+        
+        modal.addComponents(
+            new ActionRowBuilder().addComponents(phoneRoleInput),
+            new ActionRowBuilder().addComponents(pcRoleInput)
+        );
+        
+        await message.showModal(modal);
+    }
+    
+    // ========== REACTION ROLE MODAL HANDLER ==========
+    client.on('interactionCreate', async (interaction) => {
+        if (!interaction.isModalSubmit()) return;
+        
+        if (interaction.customId === 'roltest_modal') {
+            const phoneRoleId = interaction.fields.getTextInputValue('phone_role');
+            const pcRoleId = interaction.fields.getTextInputValue('pc_role');
+            
+            const phoneRole = interaction.guild.roles.cache.get(phoneRoleId);
+            const pcRole = interaction.guild.roles.cache.get(pcRoleId);
+            
+            if (!phoneRole) return interaction.reply({ content: '❌ Invalid Phone Role ID!', ephemeral: true });
+            if (!pcRole) return interaction.reply({ content: '❌ Invalid PC Role ID!', ephemeral: true });
+            
+            await createReactionPanel(interaction.channel, phoneRoleId, pcRoleId);
+            await interaction.reply({ content: '✅ Reaction role panel created!', ephemeral: true });
+            await sendLog(interaction.guild, 'REACTION ROLE PANEL', 'Channel', interaction.user, `Phone: ${phoneRole.name}, PC: ${pcRole.name}`);
+        }
+    });
     
     // ========== BAN ==========
     if (cmd === 'ban') {
@@ -660,25 +890,6 @@ client.on('messageCreate', async (message) => {
         await sendLog(guild, 'WELCOME ANNOUNCEMENT', 'Channel', member.user, 'Full welcome announcement sent');
     }
     
-    // ========== TICKET SETUP ==========
-    else if (cmd === 'ticketsetup') {
-        const categoryId = args[0];
-        const supportRoleId = args[1];
-        const transcriptChannelId = args[2];
-        if (!categoryId || !supportRoleId || !transcriptChannelId) {
-            return message.reply('Usage: `!ticketsetup <categoryID> <supportRoleID> <transcriptChannelID>`');
-        }
-        await saveTicketConfig(guild.id, categoryId, supportRoleId, transcriptChannelId);
-        await message.reply('✅ Ticket system configured! Use `!ticket` to send the panel.');
-        await sendLog(guild, 'TICKET SETUP', 'System', member.user, 'Ticket system configured');
-    }
-    
-    // ========== TICKET PANEL ==========
-    else if (cmd === 'ticket') {
-        await createTicketPanel(channel);
-        await sendLog(guild, 'TICKET PANEL', 'Channel', member.user, 'Ticket panel sent');
-    }
-    
     // ========== SUGGEST ==========
     else if (cmd === 'suggest') {
         const suggestion = args.join(' ');
@@ -730,6 +941,19 @@ client.on('messageCreate', async (message) => {
         await message.reply(`✅ Giveaway started for **${prize}**!`);
         await sendLog(guild, 'GIVEAWAY', 'Channel', member.user, `Prize: ${prize} | Duration: ${duration}m | Winners: ${winners}`);
     }
+});
+
+// ============================================
+// READY EVENT
+// ============================================
+client.once('ready', () => {
+    console.log(`✅ ${client.user.tag} is online!`);
+    console.log(`📋 Prefix: !`);
+    console.log(`👮 Mod Role ID: ${MOD_ROLE_ID || 'Not set (admin only)'}`);
+    console.log(`📝 Log Channel ID: ${LOG_CHANNEL_ID || 'Not set'}`);
+    console.log(`🎫 Ticket system ready`);
+    console.log(`🎭 Reaction role system ready`);
+    client.user.setActivity('!help | Premium Bot', { type: 3 });
 });
 
 // ============================================
