@@ -1,7 +1,7 @@
 {
-  "name": "moderation-bot",
-  "version": "3.0.0",
-  "description": "Professional Discord moderation bot with SQLite persistent database",
+  "name": "advanced-moderation-bot",
+  "version": "2.0.0",
+  "description": "Advanced Discord moderation bot with database persistence",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
