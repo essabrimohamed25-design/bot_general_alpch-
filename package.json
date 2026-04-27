@@ -1,7 +1,7 @@
 {
-  "name": "premium-moderation-bot",
-  "version": "1.0.0",
-  "description": "Professional Discord moderation bot with prefix commands",
+  "name": "premium-discord-bot",
+  "version": "3.0.0",
+  "description": "Complete Discord moderation bot with ticket system and reaction roles",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
