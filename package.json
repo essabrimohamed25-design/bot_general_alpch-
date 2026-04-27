@@ -1,16 +1,28 @@
 {
-  "name": "verification-bot",
-  "version": "1.0.0",
-  "description": "Professional Discord verification bot with prefix commands",
+  "name": "premium-discord-bot",
+  "version": "4.0.0",
+  "description": "Complete Discord moderation bot with ticket system, reaction roles, and verification system",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
     "discord.js": "^14.14.1",
-    "dotenv": "^16.3.1"
+    "dotenv": "^16.3.1",
+    "sqlite3": "^5.1.6"
   },
   "engines": {
     "node": ">=18.0.0"
-  }
+  },
+  "keywords": [
+    "discord-bot",
+    "moderation",
+    "ticket-system",
+    "reaction-roles",
+    "verification",
+    "giveaway",
+    "suggestions"
+  ],
+  "author": "",
+  "license": "MIT"
 }
